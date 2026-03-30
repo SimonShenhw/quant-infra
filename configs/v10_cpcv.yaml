@@ -1,0 +1,42 @@
+name: v10_cpcv
+
+data:
+  timeframe: 5m
+  aggregate_to: 1h
+  min_bars: 40000
+
+features:
+  zscore_window: 48
+  n_factors: 10
+
+model:
+  d_model: 64
+  gru_layers: 2
+  n_cross_heads: 4
+  n_cross_layers: 2
+  d_ff: 128
+  dropout: 0.25
+  seq_len: 24
+  max_assets: 20
+
+cv:
+  method: cpcv
+  n_groups: 6
+  n_test_groups: 2
+  purge_bars: 24
+  embargo_bars: 48
+
+train:
+  epochs: 60
+  batch_size: 64
+  lr: 0.0003
+  patience: 12
+
+execution:
+  twap_slices: 4
+  favorable_reject_rate: 0.60
+  min_hold_bars: 48
+
+portfolio:
+  initial_cash: 1000000.0
+  top_k_pct: 0.05

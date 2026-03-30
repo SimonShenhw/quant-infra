@@ -1,8 +1,12 @@
 """
-run_v8_bigdata.py — WFO on 1M+ bars Parquet data lake.
+run_v10_cpcv.py — Combinatorial Purged Cross-Validation Pipeline.
+组合净化交叉验证管线。
 
-Uses 6 months of 5m bars aggregated to 1h for WFO.
-20 assets × ~4400 1h bars = massive statistical significance.
+v10: Replaces sequential WFO with CPCV (de Prado).
+  - 6 groups, 2 test → C(6,2)=15 splits
+  - Purge = seq_len (24 bars), Embargo = zscore_window (48 bars)
+  - Each sample tested ~5 times, predictions averaged
+  - Bug fixes from v8: no lookahead in execution, embargo gap enforced
 """
 from __future__ import annotations
 
@@ -10,15 +14,16 @@ import sys
 import time
 from typing import Any, Dict, List, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch import Tensor
-import polars as pl
 
 sys.path.insert(0, ".")
 
 from data.lake_loader import load_klines_multi, klines_to_tensors
+from engine.cpcv import generate_cpcv_splits
 from engine.twap_executor import TWAPExecutor
 from model.features import build_factor_tensor
 from model.cross_asset_attention import CrossAssetGRUAttention
@@ -26,29 +31,21 @@ from model.cross_sectional import listmle_loss
 
 
 # ============================================================================
-# Aggregate 5m → 1h using Polars
+# Reuse: data loading + aggregation + DualLoss from v8
+# 复用: v8 的数据加载 + 聚合 + 双目标损失
 # ============================================================================
 
-def aggregate_5m_to_1h(df: pl.DataFrame) -> pl.DataFrame:
-    """Aggregate 5m bars to 1h bars using Polars groupby."""
-    df = df.with_columns(
-        (pl.col("open_time") // 3_600_000 * 3_600_000).alias("hour_ts")
-    )
-    agg = df.group_by("hour_ts").agg([
-        pl.col("open").first(),
-        pl.col("high").max(),
-        pl.col("low").min(),
-        pl.col("close").last(),
-        pl.col("volume").sum(),
+def aggregate_5m_to_1h(df: "pl.DataFrame") -> "pl.DataFrame":
+    import polars as pl
+    df = df.with_columns((pl.col("open_time") // 3_600_000 * 3_600_000).alias("hour_ts"))
+    return df.group_by("hour_ts").agg([
+        pl.col("open").first(), pl.col("high").max(),
+        pl.col("low").min(), pl.col("close").last(), pl.col("volume").sum(),
     ]).sort("hour_ts").rename({"hour_ts": "open_time"})
-    return agg
 
-
-# ============================================================================
-# Dual loss
-# ============================================================================
 
 class DualLoss(nn.Module):
+    """ListMLE + Focal with uncertainty weighting. / ListMLE + Focal 不确定性加权。"""
     def __init__(self) -> None:
         super().__init__()
         self.lv_r = nn.Parameter(torch.tensor(0.0))
@@ -67,47 +64,35 @@ class DualLoss(nn.Module):
         return 0.5 * pr * lr + self.lv_r + 0.5 * pd * focal + self.lv_d
 
 
-# ============================================================================
-# Build 4D dataset from Parquet
-# ============================================================================
-
 def build_from_parquet(
     seq_len: int, max_assets: int, device: torch.device
 ) -> Tuple[Tensor, Tensor, Tensor, List[str]]:
+    """Load Parquet → aggregate 5m→1h → build 4D tensor. / 加载Parquet→聚合→构建4D张量。"""
+    from data.lake_loader import load_klines_multi, klines_to_tensors
     print("[Data] Loading from Parquet data lake ...")
     raw_5m = load_klines_multi(interval="5m", min_rows=40000)
     print(f"  Loaded {len(raw_5m)} symbols with 40K+ 5m bars")
 
-    # aggregate to 1h
     syms = sorted(raw_5m.keys())[:max_assets]
-    agg_dfs: Dict[str, pl.DataFrame] = {}
-    for sym in syms:
-        agg_dfs[sym] = aggregate_5m_to_1h(raw_5m[sym])
-
+    agg_dfs = {sym: aggregate_5m_to_1h(raw_5m[sym]) for sym in syms}
     min_len = min(df.height for df in agg_dfs.values())
-    print(f"  {len(syms)} assets, {min_len} 1h bars each (aggregated from 5m)")
+    print(f"  {len(syms)} assets, {min_len} 1h bars each")
 
-    # build tensors
     close_mat = torch.zeros(min_len, len(syms), device=device)
     all_factors: Dict[str, Tensor] = {}
-
     for j, sym in enumerate(syms):
-        df = agg_dfs[sym]
-        rows = df.head(min_len)
+        rows = agg_dfs[sym].head(min_len)
         t = klines_to_tensors(rows, device)
         close_mat[:, j] = t["close"]
         all_factors[sym] = build_factor_tensor(
-            t["open"], t["high"], t["low"], t["close"], t["volume"],
-            zscore_window=48,
+            t["open"], t["high"], t["low"], t["close"], t["volume"], zscore_window=48,
         )
 
-    # forward returns
     fwd_ret = torch.zeros(min_len, len(syms), device=device)
     for j in range(len(syms)):
         c = close_mat[:, j]
         fwd_ret[:-1, j] = c[1:] / c[:-1].clamp(min=1e-8) - 1.0
 
-    # sliding windows
     n_samples = min_len - seq_len - 1
     X_list, y_list = [], []
     for i in range(n_samples):
@@ -121,7 +106,7 @@ def build_from_parquet(
 
 
 # ============================================================================
-# Train one fold
+# Train one fold / 训练单个 fold
 # ============================================================================
 
 def train_fold(model, loss_fn, X_tr, y_tr, X_va, y_va, epochs=60, bs=64, lr=3e-4):
@@ -166,44 +151,41 @@ def train_fold(model, loss_fn, X_tr, y_tr, X_va, y_va, epochs=60, bs=64, lr=3e-4
 
 
 # ============================================================================
-# WFO
+# CPCV main loop / CPCV 主循环
 # ============================================================================
 
-def run_wfo(X, y, close_mat, syms, seq_len, device):
-    n = X.size(0)
-    n_assets = len(syms)
-    # 1h bars: ~720/month. train=1month, step=2weeks
-    train_bars = 1440  # 2 months
-    step_bars = 720    # 1 month OOS per fold
+def run_cpcv(
+    X: Tensor, y: Tensor, close_mat: Tensor, syms: List[str],
+    seq_len: int, device: torch.device,
+    n_groups: int = 6, n_test_groups: int = 2,
+) -> Dict[str, Any]:
+    n_samples = X.size(0)
+    n_assets = X.size(1)
+    purge_bars = seq_len       # 24
+    embargo_bars = 48          # zscore_window
 
-    twap = TWAPExecutor(n_slices=4, favorable_reject_rate=0.60)
+    splits = generate_cpcv_splits(n_samples, n_groups, n_test_groups, purge_bars, embargo_bars)
+    print(f"\n[CPCV] {len(splits)} splits (N={n_groups}, k={n_test_groups})")
+    print(f"  purge={purge_bars}, embargo={embargo_bars}")
 
-    fold_corrs = []
-    equity = 1_000_000.0
-    eq_curve = [equity]
-    total_cost = 0.0
-    current_long, current_short = -1, -1
-    hold_counter = 0
-    min_hold = 48  # 48 hours = 2 days minimum hold
-    rebalances = 0
-    hold_periods = []
+    # collect per-sample predictions across folds / 收集每个样本在各fold中的预测
+    pred_matrix = torch.zeros(n_samples, n_assets, device=device)
+    pred_count = torch.zeros(n_samples, device=device)
+    fold_corrs: List[float] = []
+    t0_total = time.time()
 
-    cursor = train_bars
-    fold = 0
+    for fold_idx, (train_idx, test_idx) in enumerate(splits):
+        # split train into train/val (last 20% of train for early stopping)
+        # 将训练集进一步划分为训练/验证（最后20%用于早停）
+        n_tr = len(train_idx)
+        val_size = max(int(n_tr * 0.2), 20)
+        val_idx = train_idx[-val_size:]
+        actual_train_idx = train_idx[:-val_size]
 
-    embargo = 48  # must >= zscore_window to prevent feature leakage / 须>=zscore_window以防特征泄露
-
-    while cursor + embargo + step_bars <= n:
-        fold += 1
-        tr_start = max(0, cursor - train_bars)
-        val_size = max(int((cursor - tr_start) * 0.2), 20)
-        tr_end = cursor - val_size
-        va_end = cursor
-        oos_start = cursor + embargo  # PURGE: skip embargo bars after val / 净化：跳过val后的embargo条
-        oos_end = min(oos_start + step_bars, n - seq_len - 4)
-
-        if oos_start >= oos_end:
-            break
+        X_tr = X[actual_train_idx]
+        y_tr = y[actual_train_idx]
+        X_va = X[val_idx]
+        y_va = y[val_idx]
 
         model = CrossAssetGRUAttention(
             n_factors=X.size(3), d_model=64, gru_layers=2,
@@ -213,74 +195,100 @@ def run_wfo(X, y, close_mat, syms, seq_len, device):
         loss_fn = DualLoss().to(device)
 
         t0 = time.time()
-        model, corr = train_fold(
-            model, loss_fn,
-            X[tr_start:tr_end], y[tr_start:tr_end],
-            X[cursor-val_size:cursor], y[cursor-val_size:cursor],
-            epochs=60, bs=64, lr=3e-4,
-        )
+        model, corr = train_fold(model, loss_fn, X_tr, y_tr, X_va, y_va)
         fold_corrs.append(corr)
+
+        # OOS prediction / 样本外预测
         model.eval()
         with torch.no_grad():
-            for t in range(oos_start, oos_end):
-                scores = model(X[t:t+1]).squeeze(0)
-                returns = y[t]
-
-                need_rebal = False
-                if current_long < 0:
-                    need_rebal = True
-                elif hold_counter >= min_hold:
-                    nl, ns = scores.argmax().item(), scores.argmin().item()
-                    if nl != current_long or ns != current_short:
-                        need_rebal = True
-
-                if need_rebal and (hold_counter >= min_hold or current_long < 0):
-                    nl = scores.argmax().item()
-                    ns = scores.argmin().item()
-                    cost_bar = 0.0
-                    legs = sum([current_long != nl and current_long >= 0,
-                                current_short != ns and current_short >= 0,
-                                current_long != nl, current_short != ns])
-                    if legs > 0:
-                        # FIX: execute at the bar AFTER observation window
-                        # Model sees bars [t, t+seq_len-1], earliest execution is t+seq_len
-                        exec_bar = t + seq_len
-                        ci = min(exec_bar, close_mat.size(0) - 1)
-                        future_i = [min(exec_bar + k, close_mat.size(0)-1) for k in range(4)]
-                        entry_p = close_mat[ci, nl].item()
-                        futures = [close_mat[fi, nl].item() for fi in future_i]
-                        if entry_p > 0 and futures:
-                            _, cbps, _ = twap.execute_twap("BUY", equity*0.5/max(legs,1), entry_p, futures)
-                            cost_bar = equity * 0.5 * cbps / 10000.0 * legs
-                    total_cost += cost_bar
-                    if current_long >= 0: hold_periods.append(hold_counter)
-                    current_long, current_short = nl, ns
-                    hold_counter = 0
-                    rebalances += 1
-                else:
-                    cost_bar = 0.0
-
-                port_ret = 0.0
-                if current_long >= 0: port_ret += 0.5 * returns[current_long].item()
-                if current_short >= 0: port_ret -= 0.5 * returns[current_short].item()
-                port_ret -= cost_bar / max(equity, 1.0)
-                equity *= (1.0 + port_ret)
-                eq_curve.append(equity)
-                hold_counter += 1
+            X_te = X[test_idx]
+            scores = model(X_te)  # (n_test, n_assets)
+            pred_matrix[test_idx] += scores
+            pred_count[test_idx] += 1
 
         elapsed = time.time() - t0
-        print(f"  Fold {fold}: train[{tr_start}-{tr_end}] val[{cursor-val_size}-{cursor}] "
-              f"embargo[{cursor}-{oos_start}] oos[{oos_start}-{oos_end}] "
-              f"corr={corr:.4f} eq={equity:,.0f} [{elapsed:.0f}s]")
-        cursor = oos_end  # step forward past OOS (no overlap) / 步进到OOS之后（无重叠）
+        if (fold_idx + 1) % 5 == 0 or fold_idx == 0:
+            print(f"  Split {fold_idx+1}/{len(splits)}: train={len(actual_train_idx)} "
+                  f"val={val_size} test={len(test_idx)} corr={corr:.4f} [{elapsed:.0f}s]")
 
-    # metrics
+        torch.cuda.empty_cache()
+
+    # average predictions / 平均预测
+    valid_mask = pred_count > 0
+    pred_matrix[valid_mask] /= pred_count[valid_mask].unsqueeze(-1)
+
+    print(f"\n[CPCV] {len(splits)} folds done in {time.time()-t0_total:.0f}s")
+    print(f"  Avg rank_corr: {sum(fold_corrs)/len(fold_corrs):.4f}")
+    print(f"  Samples with predictions: {valid_mask.sum().item()}/{n_samples}")
+
+    # --- Sequential backtest on averaged predictions ---
+    # 用平均预测进行顺序回测
+    twap = TWAPExecutor(n_slices=4, favorable_reject_rate=0.60)
+    equity = 1_000_000.0
+    eq_curve = [equity]
+    total_cost = 0.0
+    current_long, current_short = -1, -1
+    hold_counter = 0
+    min_hold = 48
+    rebalances = 0
+    hold_periods: List[int] = []
+
+    for t in range(n_samples):
+        if not valid_mask[t]:
+            eq_curve.append(equity)
+            hold_counter += 1
+            continue
+
+        scores = pred_matrix[t]
+        returns = y[t]
+
+        need_rebal = False
+        if current_long < 0:
+            need_rebal = True
+        elif hold_counter >= min_hold:
+            nl, ns = scores.argmax().item(), scores.argmin().item()
+            if nl != current_long or ns != current_short:
+                need_rebal = True
+
+        if need_rebal and (hold_counter >= min_hold or current_long < 0):
+            nl = scores.argmax().item()
+            ns = scores.argmin().item()
+            cost_bar = 0.0
+            legs = sum([current_long != nl and current_long >= 0,
+                        current_short != ns and current_short >= 0,
+                        current_long != nl, current_short != ns])
+            if legs > 0:
+                # FIX: execute at bar AFTER observation window / 修复：在观测窗口后的bar执行
+                exec_bar = t + seq_len
+                ci = min(exec_bar, close_mat.size(0) - 1)
+                future_i = [min(exec_bar + k, close_mat.size(0)-1) for k in range(4)]
+                entry_p = close_mat[ci, nl].item()
+                futures = [close_mat[fi, nl].item() for fi in future_i]
+                if entry_p > 0 and futures:
+                    _, cbps, _ = twap.execute_twap("BUY", equity*0.5/max(legs,1), entry_p, futures)
+                    cost_bar = equity * 0.5 * cbps / 10000.0 * legs
+            total_cost += cost_bar
+            if current_long >= 0: hold_periods.append(hold_counter)
+            current_long, current_short = nl, ns
+            hold_counter = 0
+            rebalances += 1
+        else:
+            cost_bar = 0.0
+
+        port_ret = 0.0
+        if current_long >= 0: port_ret += 0.5 * returns[current_long].item()
+        if current_short >= 0: port_ret -= 0.5 * returns[current_short].item()
+        port_ret -= cost_bar / max(equity, 1.0)
+        equity *= (1.0 + port_ret)
+        eq_curve.append(equity)
+        hold_counter += 1
+
+    # metrics / 指标
     rets = [(eq_curve[i]/eq_curve[i-1])-1 for i in range(1, len(eq_curve))]
     avg = sum(rets)/len(rets) if rets else 0
     std = (sum((r-avg)**2 for r in rets)/len(rets))**0.5 if rets else 1e-9
     sharpe = (avg / max(std, 1e-9)) * (24*365)**0.5
-    peak = eq_curve[0]
-    max_dd = 0.0
+    peak = eq_curve[0]; max_dd = 0.0
     for e in eq_curve:
         peak = max(peak, e); max_dd = max(max_dd, (peak-e)/peak)
     total_ret = eq_curve[-1]/eq_curve[0] - 1
@@ -290,45 +298,40 @@ def run_wfo(X, y, close_mat, syms, seq_len, device):
         "total_return": total_ret, "sharpe": sharpe, "max_drawdown": max_dd,
         "final_equity": eq_curve[-1], "total_cost": total_cost,
         "rebalances": rebalances, "avg_hold": avg_hold,
-        "n_oos": len(rets), "n_folds": fold,
-        "avg_corr": sum(fold_corrs)/max(len(fold_corrs),1),
+        "n_samples": n_samples, "n_splits": len(splits),
+        "avg_corr": sum(fold_corrs)/max(len(fold_corrs), 1),
         "fold_corrs": fold_corrs, **twap.stats(),
     }
 
 
 # ============================================================================
-# Main
+# Main / 主入口
 # ============================================================================
 
 def main():
     print("=" * 65)
-    print("  v8.0 — 1M+ Bars | 6-Month WFO | GRU+CrossAttn")
+    print("  v10.0 — CPCV | 15-Split Purged Cross-Validation")
+    print("  20 Assets | 1h Bars | GRU+CrossAttn | Bug-Fixed Execution")
     print("=" * 65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  Device: {device} ({torch.cuda.get_device_name(0) if device.type=='cuda' else 'CPU'})")
+    print(f"  Device: {device}")
 
     SEQ_LEN = 24
     MAX_ASSETS = 20
     X, y, close_mat, syms = build_from_parquet(SEQ_LEN, MAX_ASSETS, device)
-    print(f"  Assets: {syms[:5]}...")
 
-    t0 = time.time()
-    summary = run_wfo(X, y, close_mat, syms, SEQ_LEN, device)
-    elapsed = time.time() - t0
+    summary = run_cpcv(X, y, close_mat, syms, SEQ_LEN, device, n_groups=6, n_test_groups=2)
 
     print("\n" + "=" * 65)
-    print("  v8.0 BACKTEST REPORT (1M+ bars, WFO, TWAP+AdverseSelection)")
+    print("  v10.0 CPCV BACKTEST REPORT")
     print("=" * 65)
-    print(f"  {'Source Data':.<40s} Parquet lake (1,054,080 rows)")
-    print(f"  {'Aggregation':.<40s} 5m → 1h")
     print(f"  {'Assets':.<40s} {len(syms)}")
-    print(f"  {'WFO Folds':.<40s} {summary['n_folds']}")
-    print(f"  {'OOS Periods':.<40s} {summary['n_oos']:,}")
+    print(f"  {'CPCV Splits':.<40s} {summary['n_splits']}")
+    print(f"  {'Samples':.<40s} {summary['n_samples']:,}")
     print(f"  {'Rebalances':.<40s} {summary['rebalances']}")
     print(f"  {'Avg Hold (hours)':.<40s} {summary['avg_hold']:.1f}")
     print(f"  {'Avg Rank Corr':.<40s} {summary['avg_corr']:.4f}")
-    print(f"  {'Per-fold':.<40s} {[f'{c:.3f}' for c in summary['fold_corrs']]}")
     print(f"  {'--- PERFORMANCE ---':.<40s}")
     print(f"  {'Total Return':.<40s} {summary['total_return']:>10.4%}")
     print(f"  {'Sharpe Ratio':.<40s} {summary['sharpe']:>10.4f}")
@@ -338,11 +341,9 @@ def main():
     ts = summary.get('total_slices', 0)
     if ts > 0:
         print(f"  {'--- TWAP ---':.<40s}")
-        print(f"  {'Slices':.<40s} {ts}")
         print(f"  {'Maker%':.<40s} {summary['maker_fill_pct']:.1%}")
         print(f"  {'Adverse%':.<40s} {summary['adverse_fill_pct']:.1%}")
         print(f"  {'Taker%':.<40s} {summary['taker_fill_pct']:.1%}")
-    print(f"  {'Elapsed':.<40s} {elapsed:.1f}s")
     print("=" * 65)
 
 

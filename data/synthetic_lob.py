@@ -10,6 +10,17 @@ Generates market data with learnable microstructure patterns:
 
 These patterns are subtle enough that a Transformer should be able
 to learn them, but not trivially exploitable — mimicking real markets.
+
+合成LOB（限价订单簿）逐笔数据生成器（v2）。
+
+生成包含可学习微观结构模式的行情数据：
+  - 短期动量（2-5根K线自相关）
+  - 极端位置均值回归（布林带反弹）
+  - 量价背离信号
+  - 状态切换（趋势 vs 震荡）
+  - 日内季节性模式
+
+这些模式足够微妙，Transformer应能学习但不可轻易套利，模拟真实市场。
 """
 from __future__ import annotations
 
@@ -30,6 +41,7 @@ from engine.events import (
 
 # ---------------------------------------------------------------------------
 # Regime-Switching Price Process with Learnable Microstructure
+# 带状态切换的价格过程（含可学习微观结构）
 # ---------------------------------------------------------------------------
 
 class MarketMicrostructureProcess:
@@ -41,6 +53,13 @@ class MarketMicrostructureProcess:
     2. MEAN-REVERSION: extreme deviations from SMA trigger reversal
     3. VOLUME-SIGNAL: high volume precedes trend continuation
     4. REGIME-SWITCH: alternates between trending and mean-reverting regimes
+
+    内嵌可预测模式的价格过程：
+
+    1. 动量：收益率在滞后1-3期呈正自相关
+    2. 均值回归：偏离SMA过大时触发反转
+    3. 量价信号：高成交量预示趋势延续
+    4. 状态切换：在趋势和均值回归状态间交替
     """
 
     def __init__(
@@ -62,80 +81,83 @@ class MarketMicrostructureProcess:
         self.regime_persistence: float = regime_persistence
         self.vol_signal_strength: float = volume_signal_strength
 
-        # state
+        # state / 状态
         self._returns_history: List[float] = [0.0] * 5
         self._sma20: float = s0
-        self._regime: int = 0  # 0=trending, 1=mean-reverting
+        self._regime: int = 0  # 0=trending, 1=mean-reverting / 0=趋势, 1=均值回归
         self._trend_dir: float = 1.0
-        self._vol_state: float = 1.0  # volume multiplier
+        self._vol_state: float = 1.0  # volume multiplier / 成交量乘数
         self._bar_count: int = 0
 
     def step_bar(self) -> Tuple[float, float, float, float, float]:
-        """Generate one OHLCV bar. Returns (open, high, low, close, volume)."""
+        """
+        Generate one OHLCV bar. Returns (open, high, low, close, volume).
+        生成一根OHLCV K线。返回 (开, 高, 低, 收, 量)。
+        """
         self._bar_count += 1
 
-        # --- Regime switching ---
+        # --- Regime switching --- / --- 状态切换 ---
         if random.random() > self.regime_persistence:
             self._regime = 1 - self._regime
             if self._regime == 0:
                 self._trend_dir = 1.0 if random.random() > 0.5 else -1.0
 
-        # --- Base random return ---
+        # --- Base random return --- / --- 基础随机收益 ---
         noise: float = random.gauss(0, self.base_vol)
 
-        # --- Momentum component (lag-1 autocorrelation) ---
+        # --- Momentum component (lag-1 autocorrelation) --- / --- 动量分量（滞后1期自相关） ---
         momentum: float = 0.0
-        if self._regime == 0:  # trending regime
+        if self._regime == 0:  # trending regime / 趋势状态
             recent_ret: float = self._returns_history[-1]
             momentum = self.momentum_strength * recent_ret
-            # also add weak trend drift
+            # also add weak trend drift / 同时添加弱趋势漂移
             momentum += self._trend_dir * self.base_vol * 0.05
 
-        # --- Mean-reversion component ---
+        # --- Mean-reversion component --- / --- 均值回归分量 ---
         mr: float = 0.0
         deviation: float = (self.s - self._sma20) / self._sma20 if self._sma20 > 0 else 0.0
-        if self._regime == 1:  # mean-reverting regime
+        if self._regime == 1:  # mean-reverting regime / 均值回归状态
             mr = -self.mr_speed * deviation
-        elif abs(deviation) > 0.03:  # extreme deviation triggers MR even in trending
+        elif abs(deviation) > 0.03:  # extreme deviation triggers MR even in trending / 极端偏离在趋势状态也触发均值回归
             mr = -self.mr_speed * deviation * 2.0
 
-        # --- Volume-driven signal ---
+        # --- Volume-driven signal --- / --- 量驱动信号 ---
         vol_signal: float = 0.0
-        if self._vol_state > 1.5:  # high volume → trend continuation
+        if self._vol_state > 1.5:  # high volume → trend continuation / 高成交量 → 趋势延续
             vol_signal = self.vol_signal_strength * self._returns_history[-1]
 
-        # --- Combine ---
+        # --- Combine --- / --- 合成 ---
         total_return: float = noise + momentum + mr + vol_signal
-        total_return = max(min(total_return, 0.05), -0.05)  # circuit breaker
+        total_return = max(min(total_return, 0.05), -0.05)  # circuit breaker / 熔断限制
 
         open_price: float = self.s
         close_price: float = self.s * (1.0 + total_return)
         close_price = max(close_price, 0.01)
 
-        # intrabar high/low
+        # intrabar high/low / K线内最高最低价
         intrabar_vol: float = abs(total_return) + self.base_vol * 0.5
         high_price: float = max(open_price, close_price) * (1.0 + random.uniform(0, intrabar_vol * 0.5))
         low_price: float = min(open_price, close_price) * (1.0 - random.uniform(0, intrabar_vol * 0.5))
 
-        # --- Volume generation (correlated with price movement) ---
+        # --- Volume generation (correlated with price movement) --- / --- 成交量生成（与价格变动相关） ---
         base_volume: float = 50000.0
-        # high absolute return → high volume
+        # high absolute return → high volume / 绝对收益大 → 成交量大
         vol_multiplier: float = 1.0 + 3.0 * abs(total_return) / self.base_vol
-        # add regime effect
+        # add regime effect / 添加状态效应
         if self._regime == 0:
             vol_multiplier *= 1.2
         volume: float = base_volume * vol_multiplier * random.uniform(0.7, 1.3)
 
-        # update state
+        # update state / 更新状态
         self._returns_history.append(total_return)
         if len(self._returns_history) > 20:
             self._returns_history = self._returns_history[-20:]
         self._vol_state = vol_multiplier
 
-        # update SMA20 (causal)
+        # update SMA20 (causal) / 更新SMA20（因果方向）
         self.s = close_price
         if self._bar_count >= 20:
-            # simple IIR approximation of SMA20
+            # simple IIR approximation of SMA20 / 简单IIR近似SMA20
             self._sma20 = self._sma20 * 0.95 + close_price * 0.05
         else:
             self._sma20 = close_price
@@ -150,7 +172,7 @@ class MarketMicrostructureProcess:
 
 
 # ---------------------------------------------------------------------------
-# LOB depth generator
+# LOB depth generator / LOB深度生成器
 # ---------------------------------------------------------------------------
 
 def _generate_book_levels(
@@ -172,13 +194,16 @@ def _generate_book_levels(
 
 
 # ---------------------------------------------------------------------------
-# Full synthetic data generator
+# Full synthetic data generator / 完整合成数据生成器
 # ---------------------------------------------------------------------------
 
 class SyntheticLOBGenerator:
     """
     Generate tick-level events with full LOB depth + aggregated OHLCV bars.
     v2: includes learnable microstructure patterns.
+
+    生成包含完整LOB深度 + 聚合OHLCV K线的逐笔事件。
+    v2：包含可学习的微观结构模式。
     """
 
     def __init__(
@@ -205,7 +230,10 @@ class SyntheticLOBGenerator:
         self._base_time: datetime = datetime(2025, 1, 2, 9, 30, 0)
 
     def generate_ticks(self) -> List[TickEvent]:
-        """Generate tick events with LOB depth snapshots."""
+        """
+        Generate tick events with LOB depth snapshots.
+        生成包含LOB深度快照的逐笔事件。
+        """
         random.seed(self._seed + 1000)
         process: MarketMicrostructureProcess = MarketMicrostructureProcess(
             s0=self._s0, seed=self._seed + 1000,
@@ -216,7 +244,7 @@ class SyntheticLOBGenerator:
         current_price: float = self._s0
 
         for i in range(self.n_ticks):
-            # micro-step: small random walk within a bar
+            # micro-step: small random walk within a bar / 微步：K线内小幅随机游走
             micro_ret: float = random.gauss(0, 0.001)
             current_price *= (1.0 + micro_ret)
             current_price = max(current_price, 0.01)
@@ -246,7 +274,7 @@ class SyntheticLOBGenerator:
             )
             ticks.append(tick)
 
-            # sync with bar process periodically
+            # sync with bar process periodically / 定期与K线过程同步
             if (i + 1) % self.ticks_per_bar == 0:
                 o, h, l, c, v = process.step_bar()
                 current_price = c
@@ -254,7 +282,10 @@ class SyntheticLOBGenerator:
         return ticks
 
     def generate_bars(self) -> List[MarketEvent]:
-        """Generate OHLCV bars from the microstructure process."""
+        """
+        Generate OHLCV bars from the microstructure process.
+        从微观结构过程生成OHLCV K线。
+        """
         random.seed(self._seed)
         process: MarketMicrostructureProcess = MarketMicrostructureProcess(
             s0=self._s0, seed=self._seed,
@@ -283,7 +314,10 @@ class SyntheticLOBGenerator:
         return bars
 
     def generate_all(self) -> Tuple[List[TickEvent], List[MarketEvent]]:
-        """Generate both tick stream and OHLCV bars."""
+        """
+        Generate both tick stream and OHLCV bars.
+        同时生成逐笔流和OHLCV K线。
+        """
         ticks: List[TickEvent] = self.generate_ticks()
         bars: List[MarketEvent] = self.generate_bars()
         return ticks, bars

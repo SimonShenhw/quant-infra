@@ -3,6 +3,11 @@ Portfolio and Position Management.
 
 Tracks positions, P&L, and generates performance metrics.
 Integrates with the EventBus via FillEvent handlers.
+
+组合与持仓管理。
+
+跟踪持仓、盈亏，并生成绩效指标。
+通过 FillEvent 处理器与 EventBus 集成。
 """
 from __future__ import annotations
 
@@ -20,7 +25,8 @@ from engine.events import (
 
 @dataclass
 class Position:
-    """Single-instrument position with cost-basis tracking."""
+    """Single-instrument position with cost-basis tracking.
+    单品种持仓，含成本基础跟踪。"""
     symbol: str
     quantity: float = 0.0
     avg_cost: float = 0.0
@@ -32,7 +38,8 @@ class Position:
         return self.quantity * self.avg_cost
 
     def update(self, side: OrderSide, fill_qty: float, fill_price: float, commission: float) -> float:
-        """Apply a fill.  Returns realised P&L from this fill (if closing)."""
+        """Apply a fill.  Returns realised P&L from this fill (if closing).
+        应用一笔成交，返回已实现盈亏（如有平仓）。"""
         rpnl: float = 0.0
         self.total_commission += commission
         if side == OrderSide.BUY:
@@ -75,6 +82,8 @@ class PortfolioSnapshot:
 class Portfolio:
     """
     Manages cash, positions, and equity curve.  Subscribes to FillEvents.
+
+    管理现金、持仓和权益曲线。订阅 FillEvent。
     """
 
     def __init__(self, initial_cash: float = 1_000_000.0) -> None:
@@ -84,7 +93,7 @@ class Portfolio:
         self._equity_curve: List[PortfolioSnapshot] = []
         self._fill_log: List[FillEvent] = []
 
-    # -- properties ---------------------------------------------------------
+    # -- properties / 属性 ---------------------------------------------------
 
     @property
     def cash(self) -> float:
@@ -98,10 +107,11 @@ class Portfolio:
     def equity_curve(self) -> List[PortfolioSnapshot]:
         return list(self._equity_curve)
 
-    # -- fill handling ------------------------------------------------------
+    # -- fill handling / 成交处理 --------------------------------------------
 
     def handle_fill(self, event: Event) -> None:
-        """EventBus handler for FILL events."""
+        """EventBus handler for FILL events.
+        EventBus 的 FILL 事件处理器。"""
         if not isinstance(event, FillEvent):
             return
         self._fill_log.append(event)
@@ -116,7 +126,7 @@ class Portfolio:
         else:
             self._cash += event.fill_price * event.fill_quantity - event.commission
 
-    # -- mark-to-market -----------------------------------------------------
+    # -- mark-to-market / 逐日盯市 ------------------------------------------
 
     def mark_to_market(
         self, timestamp: datetime, prices: Dict[str, float]
@@ -140,7 +150,7 @@ class Portfolio:
         self._equity_curve.append(snap)
         return snap
 
-    # -- performance --------------------------------------------------------
+    # -- performance / 绩效指标 ----------------------------------------------
 
     def summary(self) -> Dict[str, float]:
         if len(self._equity_curve) < 2:

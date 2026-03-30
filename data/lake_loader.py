@@ -14,6 +14,13 @@ Data lake structure:
           realtime/
             trades_DD_HHMMSS.parquet
             depth_DD_HHMMSS.parquet
+
+任务3：Parquet数据湖加载器。
+
+提供统一接口，从分区Parquet数据湖加载数据到Polars DataFrame或PyTorch张量。
+
+数据湖结构：
+  data_lake/{SYMBOL}/{YEAR}/{MONTH}/ 下含klines、aggTrades及realtime子目录。
 """
 from __future__ import annotations
 
@@ -29,11 +36,14 @@ DATA_LAKE: str = str(Path(__file__).resolve().parent.parent / "data_lake")
 
 
 # ---------------------------------------------------------------------------
-# Discovery
+# Discovery / 数据发现
 # ---------------------------------------------------------------------------
 
 def list_symbols(data_lake: str = DATA_LAKE) -> List[str]:
-    """List all symbols with data in the lake."""
+    """
+    List all symbols with data in the lake.
+    列出数据湖中所有有数据的交易对。
+    """
     if not os.path.exists(data_lake):
         return []
     return sorted([
@@ -45,7 +55,10 @@ def list_symbols(data_lake: str = DATA_LAKE) -> List[str]:
 def list_partitions(
     symbol: str, data_lake: str = DATA_LAKE
 ) -> List[Tuple[int, int]]:
-    """List (year, month) partitions for a symbol."""
+    """
+    List (year, month) partitions for a symbol.
+    列出某交易对的所有(年, 月)分区。
+    """
     sym_dir: str = os.path.join(data_lake, symbol)
     if not os.path.exists(sym_dir):
         return []
@@ -65,7 +78,7 @@ def list_partitions(
 
 
 # ---------------------------------------------------------------------------
-# Loading: Klines
+# Loading: Klines / 加载K线数据
 # ---------------------------------------------------------------------------
 
 def load_klines(
@@ -73,7 +86,10 @@ def load_klines(
     interval: str = "5m",
     data_lake: str = DATA_LAKE,
 ) -> pl.DataFrame:
-    """Load all kline parquet files for a symbol, sorted by time."""
+    """
+    Load all kline parquet files for a symbol, sorted by time.
+    加载某交易对所有K线Parquet文件，按时间排序。
+    """
     parts: List[Tuple[int, int]] = list_partitions(symbol, data_lake)
     frames: List[pl.DataFrame] = []
     for year, month in parts:
@@ -88,7 +104,7 @@ def load_klines(
                 continue
     if not frames:
         return pl.DataFrame()
-    # normalize schemas: keep only common OHLCV columns
+    # normalize schemas: keep only common OHLCV columns / 统一schema：仅保留通用OHLCV列
     common_cols: list = ["open_time", "open", "high", "low", "close", "volume"]
     normalized: list = []
     for f in frames:
@@ -108,7 +124,10 @@ def load_klines_multi(
     min_rows: int = 10_000,
     data_lake: str = DATA_LAKE,
 ) -> Dict[str, pl.DataFrame]:
-    """Load klines for multiple symbols, filtering by minimum rows."""
+    """
+    Load klines for multiple symbols, filtering by minimum rows.
+    加载多个交易对的K线数据，按最小行数过滤。
+    """
     if symbols is None:
         symbols = list_symbols(data_lake)
     result: Dict[str, pl.DataFrame] = {}
@@ -120,14 +139,17 @@ def load_klines_multi(
 
 
 # ---------------------------------------------------------------------------
-# Loading: AggTrades
+# Loading: AggTrades / 加载聚合成交数据
 # ---------------------------------------------------------------------------
 
 def load_aggtrades(
     symbol: str,
     data_lake: str = DATA_LAKE,
 ) -> pl.DataFrame:
-    """Load all aggTrade parquet files for a symbol."""
+    """
+    Load all aggTrade parquet files for a symbol.
+    加载某交易对所有aggTrade Parquet文件。
+    """
     parts = list_partitions(symbol, data_lake)
     frames: List[pl.DataFrame] = []
     for year, month in parts:
@@ -145,7 +167,7 @@ def load_aggtrades(
 
 
 # ---------------------------------------------------------------------------
-# Convert to PyTorch tensors (for model training)
+# Convert to PyTorch tensors (for model training) / 转换为PyTorch张量（用于模型训练）
 # ---------------------------------------------------------------------------
 
 def klines_to_tensors(
@@ -155,6 +177,9 @@ def klines_to_tensors(
     """
     Convert a klines DataFrame to OHLCV tensors.
     Returns {"open": Tensor, "high": Tensor, "low": Tensor, "close": Tensor, "volume": Tensor}
+
+    将K线DataFrame转换为OHLCV张量。
+    返回 {"open": Tensor, "high": Tensor, ...} 字典。
     """
     return {
         "open": torch.tensor(df["open"].to_numpy(), dtype=torch.float32, device=device),
@@ -166,11 +191,14 @@ def klines_to_tensors(
 
 
 # ---------------------------------------------------------------------------
-# Summary
+# Summary / 汇总
 # ---------------------------------------------------------------------------
 
 def lake_summary(data_lake: str = DATA_LAKE) -> Dict[str, Dict]:
-    """Print summary of data lake contents."""
+    """
+    Print summary of data lake contents.
+    输出数据湖内容摘要。
+    """
     symbols: List[str] = list_symbols(data_lake)
     summary: Dict[str, Dict] = {}
     total_size: int = 0
@@ -191,7 +219,7 @@ def lake_summary(data_lake: str = DATA_LAKE) -> Dict[str, Dict]:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI / 命令行入口
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":

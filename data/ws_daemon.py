@@ -9,6 +9,16 @@ Features:
   - Exponential backoff reconnection (1s → 2s → 4s → ... → 60s cap)
   - In-memory buffer → periodic Parquet flush (every N rows or M seconds)
   - Graceful shutdown on SIGINT/SIGTERM
+
+任务2：WebSocket守护进程 - 实时LOB/交易流监听器。
+
+异步守护进程，连接Binance WebSocket流并将数据写入数据湖的Parquet文件。
+
+功能特性：
+  - 硬编码Ping/Pong心跳（20秒间隔）
+  - 指数退避重连（1s → 2s → 4s → ... → 60s上限）
+  - 内存缓冲区 → 定期刷写Parquet（每N行或M秒）
+  - SIGINT/SIGTERM优雅关闭
 """
 from __future__ import annotations
 
@@ -31,10 +41,10 @@ except ImportError:
 
 DATA_LAKE: str = str(Path(__file__).resolve().parent.parent / "data_lake")
 
-# Binance combined stream
+# Binance combined stream / Binance合并流
 WS_BASE: str = "wss://stream.binance.com:9443"
 
-# Buffer config
+# Buffer config / 缓冲区配置
 FLUSH_INTERVAL_SEC: float = 30.0
 FLUSH_ROWS: int = 10_000
 MAX_BACKOFF_SEC: float = 60.0
@@ -44,6 +54,9 @@ class WebSocketDaemon:
     """
     Async daemon that listens to Binance WebSocket streams,
     buffers data in memory, and flushes to Parquet periodically.
+
+    异步守护进程，监听Binance WebSocket流，
+    在内存中缓冲数据，并定期刷写到Parquet文件。
     """
 
     def __init__(
@@ -57,12 +70,12 @@ class WebSocketDaemon:
         self._output_dir: str = output_dir
         self._running: bool = False
 
-        # data buffers
+        # data buffers / 数据缓冲区
         self._trade_buffer: List[Dict[str, Any]] = []
         self._depth_buffer: List[Dict[str, Any]] = []
         self._last_flush: float = time.time()
 
-        # reconnection state
+        # reconnection state / 重连状态
         self._backoff: float = 1.0
         self._connect_count: int = 0
 
@@ -74,7 +87,10 @@ class WebSocketDaemon:
         return f"{WS_BASE}/stream?streams={'/'.join(stream_names)}"
 
     async def _flush_to_parquet(self) -> None:
-        """Flush in-memory buffers to partitioned Parquet files."""
+        """
+        Flush in-memory buffers to partitioned Parquet files.
+        将内存缓冲区刷写到分区Parquet文件。
+        """
         now: datetime = datetime.now()
         year: str = str(now.year)
         month: str = f"{now.month:02d}"
@@ -112,7 +128,10 @@ class WebSocketDaemon:
         self._last_flush = time.time()
 
     def _process_message(self, raw: str) -> None:
-        """Parse WebSocket message and append to buffer."""
+        """
+        Parse WebSocket message and append to buffer.
+        解析WebSocket消息并追加到缓冲区。
+        """
         data: Dict[str, Any] = json.loads(raw)
         stream: str = data.get("stream", "")
         payload: Dict[str, Any] = data.get("data", {})
@@ -144,7 +163,10 @@ class WebSocketDaemon:
             self._depth_buffer.append(row)
 
     async def _connect_and_listen(self) -> None:
-        """Single connection attempt with heartbeat."""
+        """
+        Single connection attempt with heartbeat.
+        单次连接尝试（含心跳）。
+        """
         url: str = self._build_url()
         self._connect_count += 1
         print(f"  [WS] Connecting (attempt #{self._connect_count}) ...")
@@ -154,9 +176,9 @@ class WebSocketDaemon:
             ping_interval=20,
             ping_timeout=10,
             close_timeout=5,
-            max_size=2 ** 22,  # 4MB max message
+            max_size=2 ** 22,  # 4MB max message / 最大消息4MB
         ) as ws:
-            self._backoff = 1.0  # reset backoff on success
+            self._backoff = 1.0  # reset backoff on success / 连接成功后重置退避
             print(f"  [WS] Connected to {len(self._symbols)} streams")
 
             while self._running:
@@ -164,10 +186,10 @@ class WebSocketDaemon:
                     msg: str = await asyncio.wait_for(ws.recv(), timeout=30.0)
                     self._process_message(msg)
                 except asyncio.TimeoutError:
-                    # no message in 30s, connection likely dead
+                    # no message in 30s, connection likely dead / 30秒无消息，连接可能已断开
                     break
 
-                # periodic flush
+                # periodic flush / 定期刷写
                 buf_size: int = len(self._trade_buffer) + len(self._depth_buffer)
                 elapsed: float = time.time() - self._last_flush
                 if buf_size >= FLUSH_ROWS or elapsed >= FLUSH_INTERVAL_SEC:
@@ -177,6 +199,9 @@ class WebSocketDaemon:
         """
         Main loop with exponential backoff reconnection.
         Runs for `duration_seconds` then gracefully shuts down.
+
+        带指数退避重连的主循环。
+        运行 `duration_seconds` 秒后优雅关闭。
         """
         if not HAS_WS:
             print("[WS] websockets not installed, daemon cannot start")
@@ -185,13 +210,13 @@ class WebSocketDaemon:
         self._running = True
         t0: float = time.time()
 
-        # setup signal handlers
+        # setup signal handlers / 设置信号处理器
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, lambda: setattr(self, '_running', False))
             except NotImplementedError:
-                pass  # Windows doesn't support add_signal_handler
+                pass  # Windows doesn't support add_signal_handler / Windows不支持add_signal_handler
 
         print(f"[WS Daemon] Starting for {duration_seconds}s ...")
 
@@ -206,18 +231,18 @@ class WebSocketDaemon:
             if not self._running:
                 break
 
-            # exponential backoff
+            # exponential backoff / 指数退避
             print(f"  [WS] Reconnecting in {self._backoff:.1f}s ...")
             await asyncio.sleep(self._backoff)
             self._backoff = min(self._backoff * 2, MAX_BACKOFF_SEC)
 
-        # final flush
+        # final flush / 最终刷写
         await self._flush_to_parquet()
         print(f"[WS Daemon] Stopped. Total connects: {self._connect_count}")
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI / 命令行入口
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
@@ -227,7 +252,7 @@ async def main() -> None:
         streams=["aggTrade", "depth5@100ms"],
         output_dir=DATA_LAKE,
     )
-    await daemon.run(duration_seconds=30)  # 30s test run
+    await daemon.run(duration_seconds=30)  # 30s test run / 30秒测试运行
 
 
 if __name__ == "__main__":

@@ -7,6 +7,15 @@ Connects to Binance spot market WebSocket streams and collects:
   - kline_1m: 1-minute OHLCV bars
 
 Saves data as CSV files in the project directory for OOS testing.
+
+Binance WebSocket — 异步BTC/USDT逐笔+LOB数据采集器。
+
+连接Binance现货市场WebSocket流并采集：
+  - aggTrade：逐笔聚合成交
+  - depth20@100ms：20档订单簿快照
+  - kline_1m：1分钟OHLCV K线
+
+将数据保存为CSV文件，用于样本外测试。
 """
 from __future__ import annotations
 
@@ -32,7 +41,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration / 配置
 # ---------------------------------------------------------------------------
 
 SYMBOL: str = "btcusdt"
@@ -40,13 +49,13 @@ BASE_WS: str = "wss://stream.binance.com:9443"
 STREAMS: str = f"{SYMBOL}@aggTrade/{SYMBOL}@depth20@100ms/{SYMBOL}@kline_1m"
 COMBINED_URL: str = f"{BASE_WS}/stream?streams={STREAMS}"
 
-# REST API fallback for historical klines
+# REST API fallback for historical klines / REST API回退（用于获取历史K线）
 REST_BASE: str = "https://api.binance.com"
 KLINES_URL: str = f"{REST_BASE}/api/v3/klines"
 
 
 # ---------------------------------------------------------------------------
-# Data collectors
+# Data collectors / 数据采集器
 # ---------------------------------------------------------------------------
 
 class BinanceTickCollector:
@@ -54,6 +63,12 @@ class BinanceTickCollector:
     Async collector for BTC/USDT market data from Binance.
 
     Usage:
+        collector = BinanceTickCollector(output_dir="./data", duration_seconds=7200)
+        asyncio.run(collector.run())
+
+    异步BTC/USDT行情数据采集器（Binance）。
+
+    用法：
         collector = BinanceTickCollector(output_dir="./data", duration_seconds=7200)
         asyncio.run(collector.run())
     """
@@ -77,7 +92,10 @@ class BinanceTickCollector:
         self._kline_count: int = 0
 
     async def run(self) -> Dict[str, str]:
-        """Run the WebSocket collector for the specified duration."""
+        """
+        Run the WebSocket collector for the specified duration.
+        运行WebSocket采集器，持续指定时长。
+        """
         if not HAS_WEBSOCKETS:
             print("[BinanceWS] websockets not installed, using REST fallback")
             return await self._rest_fallback()
@@ -85,7 +103,7 @@ class BinanceTickCollector:
         print(f"[BinanceWS] Connecting to {COMBINED_URL}")
         print(f"[BinanceWS] Collecting for {self._duration}s ...")
 
-        # open CSV writers
+        # open CSV writers / 打开CSV写入器
         trades_fp = open(self._trades_file, "w", newline="")
         depth_fp = open(self._depth_file, "w", newline="")
         klines_fp = open(self._klines_file, "w", newline="")
@@ -169,7 +187,10 @@ class BinanceTickCollector:
         }
 
     async def _rest_fallback(self) -> Dict[str, str]:
-        """Fetch recent klines via REST API when WebSocket is unavailable."""
+        """
+        Fetch recent klines via REST API when WebSocket is unavailable.
+        WebSocket不可用时通过REST API获取近期K线。
+        """
         print("[BinanceWS] Using REST API to fetch recent BTC/USDT 1m klines")
 
         if HAS_AIOHTTP:
@@ -177,7 +198,7 @@ class BinanceTickCollector:
                 params: Dict[str, Any] = {
                     "symbol": "BTCUSDT",
                     "interval": "1m",
-                    "limit": 120,  # 2 hours of 1m bars
+                    "limit": 120,  # 2 hours of 1m bars / 2小时的1分钟K线
                 }
                 async with session.get(KLINES_URL, params=params) as resp:
                     raw: List[Any] = await resp.json()
@@ -205,14 +226,14 @@ class BinanceTickCollector:
 
 
 # ---------------------------------------------------------------------------
-# Standalone entry point
+# Standalone entry point / 独立运行入口
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
     output_dir: str = os.path.dirname(os.path.abspath(__file__))
     collector: BinanceTickCollector = BinanceTickCollector(
         output_dir=output_dir,
-        duration_seconds=30,  # quick test: 30 seconds
+        duration_seconds=30,  # quick test: 30 seconds / 快速测试：30秒
     )
     files: Dict[str, str] = await collector.run()
     for k, v in files.items():

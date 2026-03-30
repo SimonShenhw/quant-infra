@@ -3,6 +3,10 @@ Risk Management Layer.
 
 Pre-trade risk checks that can veto or modify orders before they reach
 the matching engine.
+
+风控管理层。
+
+盘前风控检查，可在订单到达撮合引擎之前否决或修改订单。
 """
 from __future__ import annotations
 
@@ -22,6 +26,8 @@ class RiskManager:
     """
     Enforces position limits, max-drawdown circuit breaker, and
     single-name concentration limits.
+
+    执行仓位限制、最大回撤熔断和单一品种集中度限制。
     """
 
     def __init__(
@@ -42,7 +48,8 @@ class RiskManager:
         return self._circuit_broken
 
     def check_order(self, event: Event) -> Optional[List[Event]]:
-        """Pre-trade risk gate.  Returns the order if OK, or a RiskEvent."""
+        """Pre-trade risk gate.  Returns the order if OK, or a RiskEvent.
+        盘前风控关卡。通过则返回订单，否则返回 RiskEvent。"""
         if not isinstance(event, OrderEvent):
             return None
 
@@ -74,6 +81,6 @@ class RiskManager:
                     )
                 ]
 
-        # Order passes risk checks — return None to let it flow to matching engine
-        # (matching engine is independently subscribed to ORDER events)
+        # Order passes risk checks — return None to let it flow to matching engine / 订单通过风控 - 返回 None 让其流向撮合引擎
+        # (matching engine is independently subscribed to ORDER events) / （撮合引擎独立订阅了 ORDER 事件）
         return None

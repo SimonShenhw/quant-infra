@@ -13,6 +13,17 @@ Features:
   - Semaphore-based rate limiting
   - Auto-extract ZIP → CSV → Polars → Parquet
   - Partitioned storage: data_lake/{asset}/{year}/{month}/
+
+任务1：Binance公开数据归档下载器。
+
+从 data.binance.vision（Binance官方S3托管的公开数据归档）下载历史
+AggTrades和Klines数据。
+
+功能特性：
+  - asyncio + aiohttp 高并发下载
+  - 基于信号量的速率限制
+  - 自动解压 ZIP → CSV → Polars → Parquet
+  - 分区存储：data_lake/{asset}/{year}/{month}/
 """
 from __future__ import annotations
 
@@ -28,7 +39,7 @@ import aiohttp
 import polars as pl
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration / 配置
 # ---------------------------------------------------------------------------
 
 BASE_URL: str = "https://data.binance.vision/data/spot/monthly"
@@ -41,7 +52,7 @@ TOP_20_SYMBOLS: List[str] = [
     "ARBUSDT", "OPUSDT", "SUIUSDT", "INJUSDT", "AAVEUSDT",
 ]
 
-# AggTrade CSV columns (per Binance documentation)
+# AggTrade CSV columns (per Binance documentation) / AggTrade CSV列定义（按Binance文档）
 AGGTRADE_COLS: List[str] = [
     "agg_trade_id", "price", "quantity", "first_trade_id",
     "last_trade_id", "timestamp", "is_buyer_maker", "is_best_match",
@@ -64,11 +75,11 @@ KLINE_COLS: List[str] = [
 ]
 
 SEMAPHORE_LIMIT: int = 5
-CHUNK_ROWS: int = 500_000  # process CSV in chunks to avoid OOM
+CHUNK_ROWS: int = 500_000  # process CSV in chunks to avoid OOM / 分块处理CSV以避免内存溢出
 
 
 # ---------------------------------------------------------------------------
-# Download + extract + convert single archive
+# Download + extract + convert single archive / 下载+解压+转换单个归档文件
 # ---------------------------------------------------------------------------
 
 async def download_and_convert(
@@ -84,20 +95,23 @@ async def download_and_convert(
     """
     Download one ZIP from Binance archive, extract CSV, convert to Parquet.
     Returns (parquet_path, n_rows).
+
+    从Binance归档下载一个ZIP文件，解压CSV，转换为Parquet。
+    返回 (parquet路径, 行数)。
     """
-    # output path
+    # output path / 输出路径
     part_dir: str = os.path.join(DATA_LAKE, symbol, str(year), f"{month:02d}")
     os.makedirs(part_dir, exist_ok=True)
     out_name: str = f"{data_type}_{interval}.parquet" if data_type == "klines" else f"{data_type}.parquet"
     parquet_path: str = os.path.join(part_dir, out_name)
 
-    # skip if already exists
+    # skip if already exists / 如已存在则跳过
     if os.path.exists(parquet_path):
         try:
             existing: pl.DataFrame = pl.read_parquet(parquet_path)
             return parquet_path, existing.height
         except Exception:
-            pass  # corrupted, re-download
+            pass  # corrupted, re-download / 文件损坏，重新下载
 
     async with sem:
         try:
@@ -111,7 +125,7 @@ async def download_and_convert(
             print(f"    [DL ERROR] {url}: {e}")
             return "", 0
 
-    # extract CSV from ZIP
+    # extract CSV from ZIP / 从ZIP中解压CSV
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             csv_names: List[str] = zf.namelist()
@@ -122,7 +136,7 @@ async def download_and_convert(
         print(f"    [ZIP ERROR] {url}: {e}")
         return "", 0
 
-    # parse CSV with Polars (streaming for large files)
+    # parse CSV with Polars (streaming for large files) / 用Polars解析CSV（大文件流式处理）
     try:
         if data_type == "aggTrades":
             df: pl.DataFrame = pl.read_csv(
@@ -132,7 +146,7 @@ async def download_and_convert(
                 schema_overrides=AGGTRADE_DTYPES,
                 n_threads=2,
             )
-            # add derived columns
+            # add derived columns / 添加衍生列
             df = df.with_columns([
                 (pl.col("timestamp") * 1000).cast(pl.Datetime("us")).alias("datetime"),
                 (pl.col("price") * pl.col("quantity")).alias("notional"),
@@ -144,7 +158,7 @@ async def download_and_convert(
                 new_columns=KLINE_COLS,
                 n_threads=2,
             )
-            # cast types
+            # cast types / 类型转换
             for col in ["open", "high", "low", "close", "volume",
                         "quote_volume", "taker_buy_volume", "taker_buy_quote_volume"]:
                 df = df.with_columns(pl.col(col).cast(pl.Float64))
@@ -156,7 +170,7 @@ async def download_and_convert(
         else:
             return "", 0
 
-        # write Parquet with snappy compression
+        # write Parquet with snappy compression / 使用snappy压缩写入Parquet
         df.write_parquet(parquet_path, compression="snappy")
         return parquet_path, df.height
 
@@ -166,7 +180,7 @@ async def download_and_convert(
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator: download all symbols × months
+# Orchestrator: download all symbols × months / 调度器：下载所有交易对×月份
 # ---------------------------------------------------------------------------
 
 async def download_archive(
@@ -178,11 +192,14 @@ async def download_archive(
     """
     Download historical data for all symbols × months.
     Returns {symbol: total_rows}.
+
+    下载所有交易对×月份的历史数据。
+    返回 {交易对: 总行数}。
     """
     if symbols is None:
         symbols = TOP_20_SYMBOLS
 
-    # generate (year, month) list going back N months
+    # generate (year, month) list going back N months / 生成往前推N个月的(年, 月)列表
     now: datetime = datetime.now()
     year_months: List[Tuple[int, int]] = []
     for m_offset in range(1, months_back + 1):
@@ -213,7 +230,7 @@ async def download_archive(
                            f"{sym}-{data_type}-{year}-{month:02d}.zip")
                 tasks.append((sym, year, month, url))
 
-        # process in batches to control memory
+        # process in batches to control memory / 分批处理以控制内存
         batch_size: int = 20
         for i in range(0, len(tasks), batch_size):
             batch = tasks[i:i + batch_size]
@@ -233,12 +250,12 @@ async def download_archive(
                 if n_rows > 0:
                     results[sym] += n_rows
 
-            # progress
+            # progress / 进度
             done: int = min(i + batch_size, len(tasks))
             total_rows: int = sum(results.values())
             print(f"  [{done}/{len(tasks)}] {total_rows:,} rows total")
 
-    # summary
+    # summary / 汇总
     print(f"\n[Archive] Download complete:")
     for sym in sorted(results.keys()):
         if results[sym] > 0:
@@ -248,7 +265,7 @@ async def download_archive(
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI / 命令行入口
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
@@ -258,7 +275,7 @@ async def main() -> None:
     import time
     t0 = time.time()
 
-    # Download 5m klines for 6 months
+    # Download 5m klines for 6 months / 下载6个月的5分钟K线数据
     kline_results = await download_archive(
         data_type="klines", interval="5m", months_back=6
     )
@@ -266,7 +283,7 @@ async def main() -> None:
     print(f"\n  Total kline rows: {total_klines:,}")
     print(f"  Elapsed: {time.time() - t0:.1f}s")
 
-    # Verify data lake structure
+    # Verify data lake structure / 验证数据湖结构
     lake = Path(DATA_LAKE)
     parquet_files = list(lake.rglob("*.parquet"))
     total_size = sum(f.stat().st_size for f in parquet_files)

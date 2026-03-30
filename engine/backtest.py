@@ -3,6 +3,11 @@ Main Backtest Orchestrator.
 
 Wires together the EventBus, data feed, strategy, execution handler,
 matching engine, portfolio, and risk manager into a single event loop.
+
+回测主调度器。
+
+将 EventBus、数据源、策略、执行处理器、撮合引擎、组合管理和风控管理器
+整合到单一事件循环中。
 """
 from __future__ import annotations
 
@@ -36,6 +41,14 @@ class BacktestEngine:
         engine.register_strategy(my_strategy_handler)
         engine.run(tick_data)
         print(engine.portfolio.summary())
+
+    生产级事件驱动回测器。
+
+    用法：
+        engine = BacktestEngine(initial_cash=1_000_000)
+        engine.register_strategy(my_strategy_handler)
+        engine.run(tick_data)
+        print(engine.portfolio.summary())
     """
 
     def __init__(
@@ -60,7 +73,7 @@ class BacktestEngine:
         self._strategy_handler: Optional[Callable[[Event], Optional[List[Event]]]] = None
         self._verbose: bool = verbose
 
-        # wire event bus — risk is checked synchronously inside execution handler
+        # wire event bus — risk is checked synchronously inside execution handler / 连接事件总线 - 风控在执行处理器内同步检查
         self.bus.subscribe(EventType.TICK, self._on_tick)
         self.bus.subscribe(EventType.MARKET, self._on_market)
         self.bus.subscribe(EventType.SIGNAL, self.execution.handle_signal)
@@ -73,7 +86,7 @@ class BacktestEngine:
         self._strategy_handler = handler
         self.bus.subscribe(EventType.MARKET, handler)
 
-    # -- internal handlers --------------------------------------------------
+    # -- internal handlers / 内部处理器 ---------------------------------------
 
     def _on_tick(self, event: Event) -> Optional[List[Event]]:
         if not isinstance(event, TickEvent):
@@ -86,17 +99,18 @@ class BacktestEngine:
         if not isinstance(event, MarketEvent):
             return None
         self.execution.update_prices({event.symbol: event.close})
-        # Seed order book with synthetic liquidity from bar data
-        # so market orders can fill (essential for bar-based backtesting)
+        # Seed order book with synthetic liquidity from bar data / 用K线数据向订单簿注入合成流动性
+        # so market orders can fill (essential for bar-based backtesting) / 使市价单可以成交（K线回测必需）
         self.matching.seed_from_bar(
             event.symbol, event.close, event.volume, event.timestamp
         )
         return None
 
-    # -- main loop ----------------------------------------------------------
+    # -- main loop / 主循环 --------------------------------------------------
 
     def run(self, events: List[Event]) -> Dict[str, float]:
-        """Execute the full backtest over a sequence of pre-built events."""
+        """Execute the full backtest over a sequence of pre-built events.
+        在预构建的事件序列上执行完整回测。"""
         t0: float = time.time()
         total_processed: int = 0
 

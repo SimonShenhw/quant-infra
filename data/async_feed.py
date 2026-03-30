@@ -3,6 +3,11 @@ Concurrent data pipeline via CCXT sync + ThreadPoolExecutor.
 
 Fetches 30+ crypto pairs × 1 month of 5m klines with pagination.
 Stores in SQLite. Uses sync CCXT (which handles geo-restrictions internally).
+
+基于CCXT同步接口 + ThreadPoolExecutor的并发数据管道。
+
+获取30+加密货币交易对 × 1个月的5分钟K线（含分页）。
+存储至SQLite。使用CCXT同步接口（内部处理地域限制）。
 """
 from __future__ import annotations
 
@@ -16,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import ccxt
 
 # ---------------------------------------------------------------------------
-# Config
+# Config / 配置
 # ---------------------------------------------------------------------------
 
 DB_PATH: str = str(Path(__file__).resolve().parent.parent / "market_data.db")
@@ -28,7 +33,7 @@ SYMBOLS_30: List[str] = [
     "APT/USDT", "ARB/USDT", "OP/USDT", "NEAR/USDT", "SUI/USDT",
     "SEI/USDT", "INJ/USDT", "RUNE/USDT", "FET/USDT", "AAVE/USDT",
     "MKR/USDT", "PEPE/USDT", "WIF/USDT", "TIA/USDT", "RENDER/USDT",
-    "SOL/USDT",  # dupe removed by set below
+    "SOL/USDT",  # dupe removed by set below / 重复项由下方去重移除
 ]
 
 MS_5M: int = 5 * 60 * 1000
@@ -36,7 +41,7 @@ THREAD_WORKERS: int = 3
 
 
 # ---------------------------------------------------------------------------
-# SQLite
+# SQLite / SQLite数据库操作
 # ---------------------------------------------------------------------------
 
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
@@ -79,7 +84,7 @@ def load_all_from_db(
 
 
 # ---------------------------------------------------------------------------
-# Paginated fetcher (single symbol, single thread)
+# Paginated fetcher (single symbol, single thread) / 分页获取器（单交易对，单线程）
 # ---------------------------------------------------------------------------
 
 def _fetch_one_symbol(
@@ -89,7 +94,10 @@ def _fetch_one_symbol(
     since_ms: int,
     now_ms: int,
 ) -> List[List[Any]]:
-    """Paginate forward for one symbol. Called from thread pool."""
+    """
+    Paginate forward for one symbol. Called from thread pool.
+    对单个交易对向前分页获取数据。由线程池调用。
+    """
     ex = getattr(ccxt, exchange_name)({"enableRateLimit": True, "timeout": 30000})
     ex.load_markets()
 
@@ -99,7 +107,7 @@ def _fetch_one_symbol(
     all_candles: List[List[Any]] = []
     cursor: int = since_ms
 
-    for _ in range(80):  # max pages
+    for _ in range(80):  # max pages / 最大分页数
         try:
             ohlcv = ex.fetch_ohlcv(symbol, timeframe, since=cursor, limit=300)
         except Exception:
@@ -121,7 +129,7 @@ def _fetch_one_symbol(
 
         time.sleep(0.4)
 
-    # deduplicate + sort
+    # deduplicate + sort / 去重+排序
     seen: set = set()
     deduped = [c for c in all_candles if c[0] not in seen and not seen.add(c[0])]
     deduped.sort(key=lambda x: x[0])
@@ -129,7 +137,7 @@ def _fetch_one_symbol(
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Main pipeline / 主管道
 # ---------------------------------------------------------------------------
 
 def fetch_all_symbols(
@@ -140,14 +148,14 @@ def fetch_all_symbols(
     exchange_name: str = "okx",
 ) -> Dict[str, int]:
     if symbols is None:
-        symbols = list(dict.fromkeys(SYMBOLS_30))  # dedupe preserving order
+        symbols = list(dict.fromkeys(SYMBOLS_30))  # dedupe preserving order / 保序去重
 
     conn = init_db(db_path)
     now_ms = int(time.time() * 1000)
     since_ms = now_ms - days_back * 86400 * 1000
     results: Dict[str, int] = {}
 
-    # check cache
+    # check cache / 检查缓存
     to_fetch: List[str] = []
     for sym in symbols:
         clean = sym.replace("/", "")
@@ -160,7 +168,7 @@ def fetch_all_symbols(
 
     print(f"  [FETCH] {len(to_fetch)} symbols to download ({exchange_name}) ...")
 
-    # use ThreadPoolExecutor for concurrent I/O
+    # use ThreadPoolExecutor for concurrent I/O / 使用线程池进行并发I/O
     def _worker(sym: str) -> Tuple[str, List[List[Any]]]:
         candles = _fetch_one_symbol(exchange_name, sym, timeframe, since_ms, now_ms)
         return sym, candles

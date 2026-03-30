@@ -3,6 +3,11 @@ Limit Order Book (LOB) and Matching Engine.
 
 Implements a price-time priority matching engine with full order book
 depth tracking.  Supports LIMIT and MARKET orders with partial fills.
+
+限价订单簿 (LOB) 与撮合引擎。
+
+实现价格-时间优先的撮合引擎，支持完整订单簿深度追踪。
+支持限价单和市价单，含部分成交。
 """
 from __future__ import annotations
 
@@ -26,12 +31,13 @@ from engine.events import (
 
 
 # ---------------------------------------------------------------------------
-# Internal order representation
+# Internal order representation / 内部订单表示
 # ---------------------------------------------------------------------------
 
 @dataclass
 class BookOrder:
-    """Resting order inside the LOB."""
+    """Resting order inside the LOB.
+    订单簿中的挂单。"""
     order_id: str
     symbol: str
     side: OrderSide
@@ -48,7 +54,7 @@ class BookOrder:
 
 
 # ---------------------------------------------------------------------------
-# Single-side book (bid or ask)
+# Single-side book (bid or ask) / 单边订单簿（买盘或卖盘）
 # ---------------------------------------------------------------------------
 
 class _HalfBook:
@@ -56,11 +62,15 @@ class _HalfBook:
     One side of the order book backed by a heap.
 
     For bids we use a max-heap (negate prices); for asks a min-heap.
+
+    基于堆的单边订单簿。
+
+    买盘使用最大堆（价格取反）；卖盘使用最小堆。
     """
 
     def __init__(self, is_bid: bool) -> None:
         self._is_bid: bool = is_bid
-        self._heap: List[Tuple[float, float, str]] = []  # (sort_key, ts, id)
+        self._heap: List[Tuple[float, float, str]] = []  # (sort_key, ts, id) / (排序键, 时间戳, ID)
         self._orders: Dict[str, BookOrder] = {}
 
     def insert(self, order: BookOrder) -> None:
@@ -96,12 +106,14 @@ class _HalfBook:
         return False
 
     def reset(self) -> None:
-        """Clear all resting orders."""
+        """Clear all resting orders.
+        清除所有挂单。"""
         self._heap.clear()
         self._orders.clear()
 
     def depth(self, levels: int = 5) -> List[Tuple[float, float]]:
-        """Return [(price, total_qty)] aggregated by price, best first."""
+        """Return [(price, total_qty)] aggregated by price, best first.
+        返回按价格聚合的 [(价格, 总量)]，最优价在前。"""
         agg: Dict[float, float] = defaultdict(float)
         for order in self._orders.values():
             if order.is_live:
@@ -113,11 +125,12 @@ class _HalfBook:
 
 
 # ---------------------------------------------------------------------------
-# Order Book per symbol
+# Order Book per symbol / 单品种订单簿
 # ---------------------------------------------------------------------------
 
 class OrderBook:
-    """Full two-sided limit order book for a single instrument."""
+    """Full two-sided limit order book for a single instrument.
+    单一品种的完整双边限价订单簿。"""
 
     def __init__(self, symbol: str, tick_size: float = 0.01) -> None:
         self.symbol: str = symbol
@@ -128,7 +141,7 @@ class OrderBook:
         self.last_trade_qty: float = 0.0
         self._trade_log: List[Dict[str, object]] = []
 
-    # -- accessors ----------------------------------------------------------
+    # -- accessors / 访问器 --------------------------------------------------
 
     @property
     def best_bid(self) -> Optional[float]:
@@ -160,12 +173,13 @@ class OrderBook:
     def trade_log(self) -> List[Dict[str, object]]:
         return list(self._trade_log)
 
-    # -- matching -----------------------------------------------------------
+    # -- matching / 撮合 ----------------------------------------------------
 
     def submit_order(
         self, order: BookOrder
     ) -> List[FillEvent]:
-        """Match an incoming order against resting liquidity."""
+        """Match an incoming order against resting liquidity.
+        将传入订单与挂单流动性进行撮合。"""
         fills: List[FillEvent] = []
         if order.order_type == OrderType.MARKET:
             fills = self._match_market(order)
@@ -238,19 +252,19 @@ class OrderBook:
                 }
             )
 
-            # Adaptive transaction costs by asset class
+            # Adaptive transaction costs by asset class / 按资产类别自适应交易成本
             notional: float = match_price * match_qty
             commission: float
             total_slippage: float
 
             if match_price > 500.0:
-                # CRYPTO: Taker fee 4bps (Binance/OKX VIP0), no stamp tax
+                # CRYPTO: Taker fee 4bps (Binance/OKX VIP0), no stamp tax / 加密货币：Taker费4bps，无印花税
                 commission = notional * 0.0004
-                # slippage: tighter for liquid crypto
+                # slippage: tighter for liquid crypto / 滑点：流动性好的加密货币更小
                 impact_bps: float = 2.0 * (match_qty * match_price / 100000.0) ** 0.5
                 total_slippage = notional * impact_bps / 10000.0
             else:
-                # A-SHARE: commission 2.5bps + stamp tax 5bps sell + exchange 0.5bps
+                # A-SHARE: commission 2.5bps + stamp tax 5bps sell + exchange 0.5bps / A股：佣金2.5bps + 卖出印花税5bps + 交易所费0.5bps
                 broker_fee: float = max(notional * 0.00025, 5.0)
                 stamp_tax: float = notional * 0.0005 if aggressor.side == OrderSide.SELL else 0.0
                 commission = broker_fee + stamp_tax + notional * 0.00005
@@ -273,13 +287,16 @@ class OrderBook:
 
 
 # ---------------------------------------------------------------------------
-# Matching Engine — multi-symbol wrapper
+# Matching Engine — multi-symbol wrapper / 撮合引擎 - 多品种封装
 # ---------------------------------------------------------------------------
 
 class MatchingEngine:
     """
     Routes OrderEvents to per-symbol OrderBooks, returns FillEvents.
     Designed to plug directly into the EventBus.
+
+    将 OrderEvent 路由到对应品种的 OrderBook，返回 FillEvent。
+    设计为直接接入 EventBus。
     """
 
     def __init__(self, tick_size: float = 0.01) -> None:
@@ -292,7 +309,8 @@ class MatchingEngine:
         return self._books[symbol]
 
     def handle_order(self, event: Event) -> Optional[List[Event]]:
-        """EventBus handler for ORDER events."""
+        """EventBus handler for ORDER events.
+        EventBus 的 ORDER 事件处理器。"""
         if not isinstance(event, OrderEvent):
             return None
         book: OrderBook = self.get_or_create_book(event.symbol)
@@ -310,11 +328,12 @@ class MatchingEngine:
         return fills if fills else None
 
     def handle_tick(self, event: Event) -> None:
-        """Seed book liquidity from TickEvents (LOB depth snapshot replaces old state)."""
+        """Seed book liquidity from TickEvents (LOB depth snapshot replaces old state).
+        从 TickEvent 填充订单簿流动性（LOB 深度快照替换旧状态）。"""
         if not isinstance(event, TickEvent):
             return
         book: OrderBook = self.get_or_create_book(event.symbol)
-        # reset book — each tick is a full LOB snapshot, not incremental
+        # reset book — each tick is a full LOB snapshot, not incremental / 重置订单簿 - 每个 Tick 是完整快照，非增量
         book.bids.reset()
         book.asks.reset()
         if event.bid_levels:
@@ -355,13 +374,17 @@ class MatchingEngine:
         Seed synthetic liquidity from an OHLCV bar.
         Creates bid/ask levels around the close price so market orders can fill.
         Essential for bar-based backtesting without tick data.
+
+        从 OHLCV K 线生成合成流动性。
+        围绕收盘价创建买卖盘位，使市价单可以成交。
+        在无 Tick 数据的 K 线回测中必不可少。
         """
         book: OrderBook = self.get_or_create_book(symbol)
         book.bids.reset()
         book.asks.reset()
 
-        spread: float = close_price * 0.0002  # 2bps spread
-        available_qty: float = max(volume * 0.1, 1.0)  # 10% of bar volume
+        spread: float = close_price * 0.0002  # 2bps spread / 2基点价差
+        available_qty: float = max(volume * 0.1, 1.0)  # 10% of bar volume / K线成交量的10%
 
         for i in range(1, 6):
             bid_price: float = round(close_price - spread * i, 2)

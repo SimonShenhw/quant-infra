@@ -3,6 +3,11 @@ Fetch real BTC/USDT historical data via CCXT (exchange-agnostic).
 
 Falls back through multiple exchanges to handle geo-restrictions.
 Saves 1m OHLCV data as CSV for out-of-sample testing.
+
+通过CCXT获取真实BTC/USDT历史数据（交易所无关）。
+
+依次尝试多个交易所以处理地域限制。
+将1分钟OHLCV数据保存为CSV，用于样本外测试。
 """
 from __future__ import annotations
 
@@ -23,8 +28,11 @@ def fetch_btc_klines(
     """
     Fetch BTC/USDT 1m klines from the first available exchange.
     Returns path to the saved CSV file.
+
+    从首个可用交易所获取BTC/USDT 1分钟K线。
+    返回已保存CSV文件的路径。
     """
-    # Try multiple exchanges in order of reliability for China users
+    # Try multiple exchanges in order of reliability for China users / 按中国用户可靠性排序尝试多个交易所
     exchanges: List[str] = ["okx", "bybit", "gate", "mexc", "kucoin", "binance"]
 
     for name in exchanges:
@@ -41,11 +49,11 @@ def fetch_btc_klines(
                     print(f"  -> {name}: BTC/USDT not found")
                     continue
 
-            # fetch recent klines
+            # fetch recent klines / 获取近期K线
             since: Optional[int] = None
             all_klines: List[Any] = []
 
-            # paginate to get more data
+            # paginate to get more data / 分页获取更多数据
             all_klines = []
             fetch_since: Optional[int] = None
             max_pages: int = max(1, limit // 300)
@@ -59,14 +67,14 @@ def fetch_btc_klines(
                 fetch_since = ohlcv[-1][0] + 1
                 if len(ohlcv) < 100:
                     break
-                time.sleep(0.5)  # rate limit
+                time.sleep(0.5)  # rate limit / 速率限制
 
             if not all_klines:
                 print(f"  -> {name}: no data returned")
                 continue
             print(f"  -> {name}: fetched {len(all_klines)} bars")
 
-            # save to CSV
+            # save to CSV / 保存为CSV
             ts: str = datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath: str = os.path.join(output_dir, f"btcusdt_{name}_{timeframe}_{ts}.csv")
             with open(filepath, "w", newline="") as f:

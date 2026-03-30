@@ -3,6 +3,11 @@ Multi-asset Crypto data feed via CCXT.
 
 Fetches historical OHLCV for multiple symbols in parallel,
 returns a dict of {symbol: List[MarketEvent]}.
+
+基于CCXT的多资产加密货币数据源。
+
+并行获取多个交易对的历史OHLCV数据，
+返回 {交易对: List[MarketEvent]} 字典。
 """
 from __future__ import annotations
 
@@ -16,7 +21,7 @@ import ccxt
 
 from engine.events import EventType, MarketEvent
 
-# Top crypto pairs by liquidity
+# Top crypto pairs by liquidity / 按流动性排名的头部加密货币交易对
 DEFAULT_SYMBOLS: List[str] = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
     "XRP/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT",
@@ -33,6 +38,9 @@ def fetch_multi_asset(
     """
     Fetch OHLCV for multiple symbols from a single exchange.
     Returns {symbol_clean: [MarketEvent, ...]}.
+
+    从单个交易所获取多个交易对的OHLCV数据。
+    返回 {清洗后交易对名: [MarketEvent, ...]}。
     """
     if symbols is None:
         symbols = DEFAULT_SYMBOLS
@@ -58,7 +66,7 @@ def fetch_multi_asset(
 
     for sym in symbols:
         if sym not in ex.markets:
-            # try futures variant
+            # try futures variant / 尝试合约变体
             alt: str = sym + ":USDT"
             if alt not in ex.markets:
                 print(f"  -> {sym}: not found, skipping")
@@ -88,7 +96,7 @@ def fetch_multi_asset(
             result[clean_sym] = bars
             print(f"  -> {clean_sym}: {len(bars)} bars "
                   f"[{bars[0].close:.2f} -> {bars[-1].close:.2f}]")
-            time.sleep(0.3)  # rate limit
+            time.sleep(0.3)  # rate limit / 速率限制
 
         except Exception as e:
             print(f"  -> {sym}: error {e}")

@@ -12,9 +12,9 @@ A complete quantitative trading infrastructure covering the full pipeline: **dat
 
 完整的量化交易基础设施，覆盖全链路：**数据采集 → 因子工程 → 模型训练 → 信号生成 → 订单执行 → 组合管理 → 绩效分析**。以中央事件总线（EventBus）为核心架构，所有组件可插拔替换。
 
-The project was developed iteratively across 9 versions (v1–v9), each addressing critical flaws discovered in the previous version — from data leakage bugs to unrealistic execution assumptions. The final version runs Walk-Forward Optimization across 60 folds on 1M+ bars of real Binance market data with adversarial execution modeling.
+The project was developed iteratively across 10 versions (v1–v10), each addressing critical flaws discovered in the previous version — from data leakage bugs to unrealistic execution assumptions to cross-validation methodology. The final v10 uses Combinatorial Purged Cross-Validation (CPCV) across 15 splits on 1M+ bars of real Binance market data, with adversarial execution modeling, achieving **Sharpe 0.38 and +58% return** on purely out-of-sample data.
 
-项目经历了 9 个大版本的迭代（v1–v9），每个版本都在解决上一版暴露出的致命缺陷——从数据泄露 bug 到不切实际的撮合假设。最终版本在 100 万+ 条真实 Binance 市场数据上运行了 60 折 Walk-Forward 滚动优化，并包含逆向选择撮合模拟。
+项目经历了 10 个大版本的迭代（v1–v10），每个版本都在解决上一版暴露出的致命缺陷——从数据泄露、不切实际的撮合假设到交叉验证方法论漏洞。最终 v10 在 100 万+ 条真实 Binance 市场数据上使用组合净化交叉验证（CPCV, 15 splits），含逆向选择撮合模拟，在纯样本外数据上达到 **Sharpe 0.38、收益率 +58%**。
 
 ---
 
@@ -25,26 +25,36 @@ The project was developed iteratively across 9 versions (v1–v9), each addressi
 │              Data Layer 数据层 (data/)                        │
 │  Binance Archive Downloader ──→ Parquet Data Lake            │
 │  CCXT Multi-Exchange Feed   ──→ SQLite Cache                 │
-│  WebSocket Daemon           ──→ Real-time Parquet Stream     │
+│  WebSocket Daemon           ──→ Avro/Parquet Stream          │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────┐
+│              Factor Layer 因子层 (factors/)                   │
+│  Plugin Factor Library (10 hot-loadable .py files)           │
+│  FactorRegistry: auto-discover + @register_factor            │
+│  Causal rolling z-score normalization (no look-ahead)        │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
 │              Model Layer 模型层 (model/)                      │
-│  Feature Engineering (10 factors, causal rolling z-score)     │
-│  QuantTransformer (Encoder-Decoder, 3 presets)                │
-│  CrossAssetGRUAttention (GRU + cross-asset self-attention)    │
-│  CrossSectionalTransformer (4D [B,A,T,F] + ListMLE)          │
-│  Dual Loss: ListMLE + Focal + Uncertainty Weighting           │
+│  CrossAssetGRUAttention (GRU temporal + cross-asset attn)    │
+│  QuantTransformer (Encoder-Decoder, 3 presets)               │
+│  CrossSectionalTransformer (4D [B,A,T,F] + ListMLE)         │
+│  Dual Loss: ListMLE + Focal + Uncertainty Weighting          │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
 │              Engine Layer 引擎层 (engine/)                    │
+│  CPCV: Combinatorial Purged Cross-Validation (15 splits)     │
 │  EventBus (pub/sub, 7 event types)                           │
-│  LOB Matching Engine (price-time priority)                    │
-│  Adverse Selection Simulator (80% reject / 100% adverse)     │
-│  TWAP Executor (4-slice split orders)                         │
-│  Kelly Criterion Position Sizing                              │
-│  Portfolio + Risk Manager (drawdown circuit breaker)          │
+│  Adverse Selection Simulator + TWAP Executor                 │
+│  Kelly Criterion Sizing + Drawdown Circuit Breaker           │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────┐
+│         Paper Trading 模拟盘 (paper_trading/)                │
+│  Live WebSocket → Model Inference → Simulated Execution      │
+│  SQLite Logger (signals / fills / equity snapshots)           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -56,91 +66,127 @@ The project was developed iteratively across 9 versions (v1–v9), each addressi
 
 | Module 模块 | Description 描述 |
 |--------|-------------|
-| `events.py` | Typed EventBus with 7 event types (Tick, Market, Signal, Order, Fill, Risk) / 类型化事件总线，7 种事件类型 |
-| `order_book.py` | LOB with price-time priority matching, adaptive cost model (A-share / Crypto) / 限价指令簿撮合引擎，自适应成本模型（A 股/加密货币） |
-| `adverse_selection.py` | Micro-execution simulator: favorable moves 80% rejected, adverse 100% filled / 逆向选择模拟器：有利行情 80% 拒单，不利行情 100% 成交 |
-| `twap_executor.py` | Time-Weighted Average Price split-order execution / TWAP 拆单执行器，分 N 个 Bar 缓慢吃单 |
+| `cpcv.py` | Combinatorial Purged Cross-Validation with purge + embargo / 组合净化交叉验证，含净化+隔离 |
+| `events.py` | Typed EventBus with 7 event types / 类型化事件总线，7 种事件类型 |
+| `order_book.py` | LOB matching, adaptive cost model (A-share / Crypto) / 限价指令簿撮合，自适应成本模型 |
+| `adverse_selection.py` | Micro-execution: 80% favorable reject, 100% adverse fill / 逆向选择模拟器 |
+| `twap_executor.py` | TWAP split-order execution / TWAP 拆单执行器 |
 | `execution.py` | Kelly Criterion dynamic position sizing / Kelly 公式动态仓位管理 |
-| `portfolio.py` | Position tracking, equity curve, Sharpe/Calmar/MaxDD / 持仓跟踪、权益曲线、夏普/卡尔玛/最大回撤 |
+| `portfolio.py` | Position tracking, equity curve, Sharpe/Calmar/MaxDD / 持仓跟踪、权益曲线 |
 | `risk.py` | Max drawdown circuit breaker / 最大回撤熔断器 |
-| `backtest.py` | Event loop orchestrator / 事件循环主控 |
+
+### Factors 因子库 (`factors/`)
+
+| Module 模块 | Description 描述 |
+|--------|-------------|
+| `base.py` | `BaseFactor` ABC + `@register_factor` decorator + `FactorRegistry` / 基类+装饰器+注册表 |
+| `log_return.py` | Log returns / 对数收益率 |
+| `sma_ratio.py` | SMA5 and SMA20 price ratios / SMA5/SMA20 价格比率 |
+| `ema_ratio.py` | EMA10 price ratio / EMA10 价格比率 |
+| `rsi.py` | Relative Strength Index / 相对强弱指标 |
+| `macd.py` | MACD histogram / MACD 柱状图 |
+| `bollinger.py` | Bollinger Band position / 布林带位置 |
+| `volume_zscore.py` | Volume z-score / 成交量 z-score |
+| `trade_imbalance.py` | Trade-based order imbalance (OBI) / 基于成交的订单不平衡度 |
+| `price_impact.py` | Amihud illiquidity ratio / Amihud 非流动性比率 |
 
 ### Models 模型 (`model/`)
 
 | Module 模块 | Description 描述 |
 |--------|-------------|
-| `transformer.py` | Encoder-Decoder Transformer (small/medium/large presets, CUDA) / 编码器-解码器 Transformer，3 档预设，CUDA 加速 |
-| `cross_asset_attention.py` | GRU temporal + cross-asset self-attention for lead-lag / GRU 时序编码 + 跨资产自注意力，捕捉领先-滞后关系 |
-| `cross_sectional.py` | 4D `[Batch, Assets, Seq, Features]` + ListMLE ranking loss / 4D 张量横截面架构 + ListMLE 排序损失 |
-| `features.py` | 10 causal factors, rolling z-score (no look-ahead) / 10 个因果因子，滚动 z-score 归一化（无未来函数） |
-| `obi_features.py` | Order Book Imbalance: trade imbalance, Amihud illiquidity / 订单簿不平衡度：交易不平衡、Amihud 非流动性 |
-| `strategy.py` | Dynamic vol-adjusted thresholds, stop-loss/take-profit / 动态波动率阈值、止损止盈、冷却期 |
+| `cross_asset_attention.py` | GRU temporal + cross-asset self-attention / GRU 时序 + 跨资产自注意力 |
+| `transformer.py` | Encoder-Decoder Transformer (3 presets, CUDA) / 编解码 Transformer |
+| `cross_sectional.py` | 4D `[B, A, T, F]` + ListMLE ranking loss / 4D 横截面 + 排序损失 |
+| `features.py` | Feature pipeline (delegates to factor registry) / 因子管线 |
+| `obi_features.py` | Order Book Imbalance features / 订单簿不平衡度因子 |
 
 ### Data 数据 (`data/`)
 
 | Module 模块 | Description 描述 |
 |--------|-------------|
-| `archive_downloader.py` | Bulk download from `data.binance.vision` → Parquet / 从 Binance 公开归档批量下载 → Parquet |
-| `async_feed.py` | CCXT multi-exchange concurrent feed → SQLite / CCXT 多交易所并发拉取 → SQLite |
-| `ws_daemon.py` | WebSocket daemon + heartbeat + exponential backoff / WebSocket 守护进程 + 心跳 + 指数退避重连 |
-| `lake_loader.py` | Parquet data lake reader, partitioned `{asset}/{year}/{month}/` / Parquet 数据湖加载器，按资产/年/月分区 |
-| `synthetic_lob.py` | Synthetic LOB with regime-switching microstructure / 合成 LOB 数据生成器，含 regime 切换微结构 |
+| `archive_downloader.py` | Bulk download `data.binance.vision` → Parquet / Binance 归档批量下载 |
+| `async_feed.py` | CCXT concurrent feed → SQLite / CCXT 并发拉取 |
+| `ws_daemon.py` | WebSocket daemon + heartbeat + exp backoff / WebSocket 守护进程 |
+| `avro_writer.py` | Avro streaming serialization for real-time data / Avro 实时流序列化 |
+| `lake_loader.py` | Parquet data lake reader / 数据湖加载器 |
+
+### Config 配置 (`config/`)
+
+| Module 模块 | Description 描述 |
+|--------|-------------|
+| `schema.py` | 8 typed dataclasses: Data, Feature, Model, CV, Train, Execution, Portfolio / 8个类型化配置类 |
+| `__init__.py` | `load_config(yaml_path)` + `default_config()` / YAML加载 + 默认配置 |
+
+### Paper Trading 模拟盘 (`paper_trading/`)
+
+| Module 模块 | Description 描述 |
+|--------|-------------|
+| `engine.py` | Live bar ingestion → inference → simulated execution / 实时K线 → 推理 → 模拟执行 |
+| `logger.py` | SQLite logger: signals, fills, equity snapshots / SQLite 日志 |
 
 ---
 
 ## Version History | 版本迭代史
 
-Each version addressed specific failures discovered in the previous iteration:
-
-每个版本都针对上一版暴露出的具体缺陷进行修复：
-
 | Version 版本 | What Changed 改动 | Why 原因 |
 |---------|-------------|-----|
-| **v1** | Basic single-asset Transformer + MSE / 单资产 Transformer + MSE 损失 | Starting point / 起点 |
-| **v2** | Fixed data leakage (global → rolling z-score) / 修复数据泄露（全局归一化 → 滚动 z-score） | v1 MSE = 10⁻⁶ was fake — future info in features / v1 的 MSE 是假的，特征中混入了未来信息 |
-| **v3** | Directional Focal Loss + OBI features / 方向性 Focal 损失 + OBI 因子 | MSE can't predict direction (arXiv 2603.16886) / MSE 训练的模型无法预测方向 |
-| **v4** | Multi-asset 4D tensors + ListMLE ranking / 多资产 4D 张量 + ListMLE 排序 | Absolute return prediction is hopeless; ranking is tractable / 绝对收益预测无望，排序可行 |
-| **v5** | Adverse selection execution model / 逆向选择撮合模型 | v4 Sharpe 1.38 was a "fill illusion" / v4 的高夏普是"成交幻觉" |
-| **v6** | 1h + TWAP + 48h holding lock + top/bottom 5% / 1h 级别 + TWAP + 48h 持仓锁 + 头尾 5% 过滤 | v5 lost 48% to friction / v5 被摩擦成本吃掉 48% |
-| **v7** | Walk-Forward Optimization + GRU cross-asset attention / WFO 滚动优化 + GRU 跨资产注意力 | Static split leaks info across time / 静态划分在时间维度上泄露信息 |
-| **v8** | 1M+ bars from Binance archive, 60-fold WFO / Binance 归档 100 万+ 条数据，60 折 WFO | 720 bars was not statistically significant / 720 条数据不具备统计显著性 |
-| **v9** | Reversal signal diagnosis / 反转信号诊断 | Proved model beats pure factors / 证明模型优于纯因子策略 |
+| **v1** | Single-asset Transformer + MSE / 单资产 Transformer + MSE | Starting point / 起点 |
+| **v2** | Fixed data leakage (global → rolling z-score) / 修复数据泄露 | v1 MSE = 10⁻⁶ was fake / v1 的 MSE 是假的 |
+| **v3** | Directional Focal Loss + OBI features / 方向性 Focal 损失 | MSE can't predict direction / MSE 无法预测方向 |
+| **v4** | Multi-asset 4D tensors + ListMLE ranking / 多资产 ListMLE | Ranking > absolute return prediction / 排序优于绝对收益预测 |
+| **v5** | Adverse selection execution / 逆向选择撮合 | v4 Sharpe 1.38 was "fill illusion" / v4 高夏普是"成交幻觉" |
+| **v6** | 1h + TWAP + 48h hold lock + 5% filter / 低频+TWAP+持仓锁 | v5 lost 48% to friction / v5 被摩擦吃掉 48% |
+| **v7** | Walk-Forward + GRU cross-asset attention / WFO+GRU跨资产注意力 | Static split leaks info / 静态划分泄露信息 |
+| **v8** | 1M+ bars, 60-fold WFO / 百万数据60折WFO | 720 bars not significant / 720条无统计意义 |
+| **v9** | Reversal diagnosis / 反转诊断 | Proved model > pure factors / 证明模型优于纯因子 |
+| **v10** | **CPCV + config + factor plugins + paper trading + avro** | WFO has boundary leakage; need industrial infra / WFO有边界泄露；需工业级基建 |
 
 ---
 
 ## Results | 回测结果
 
-### v8 — 60-fold Walk-Forward, 43K OOS bars | 60 折滚动验证，43K 条样本外数据
+### v10 — 15-split CPCV, 44K OOS bars | 15 折组合净化交叉验证
 
 ```
-Source / 数据源:       Binance 5m klines (6 months) aggregated to 1h
-                       Binance 5分钟K线（6个月）聚合为1小时
+Source / 数据源:       Binance 5m klines (6 months, 886K rows) → aggregated to 1h
+                       Binance 5分钟K线（6个月，88.6万行）→ 聚合为1小时
 Assets / 资产:         20 crypto pairs / 20个加密货币交易对
-WFO Folds / 滚动折数:  60 (each: 2-month train, 1-month OOS)
-                       60折（每折：2个月训练，1个月样本外）
-OOS Periods / OOS样本:  43,200 bars / 43,200条
-Execution / 执行:       TWAP 4-slice + adverse selection (51% adverse fill)
-                       TWAP 4片拆单 + 逆向选择（51%逆向成交率）
+Validation / 验证:     CPCV (N=6, k=2) → 15 splits, purge=24, embargo=48
+                       组合净化交叉验证，15个划分，净化=24，隔离=48
+OOS Coverage / OOS覆盖: 44,760 bars (100% of samples) / 全部样本
+Execution / 执行:       TWAP 4-slice + adverse selection (64% adverse fill)
 
-Total Return / 总收益:       +1.22%
-Sharpe Ratio / 夏普比率:     0.08
-Max Drawdown / 最大回撤:     16.4%
-Rebalances / 换仓次数:       900
+Total Return / 总收益:       +58.0%
+Sharpe Ratio / 夏普比率:     0.38
+Max Drawdown / 最大回撤:     37.5%
+Final Equity / 最终权益:     $1,580,013
+Rebalances / 换仓次数:       933
 Avg Hold / 平均持仓:         48 hours / 48小时
-Avg Rank Corr / 平均排名相关: 0.025 (positive in 59/60 folds / 59/60折为正)
-Transaction Cost / 交易成本:  $307K (30.7% of capital / 占本金30.7%)
+Avg Rank Corr / 平均排名相关: 0.068 (all 15 folds positive / 15折全部为正)
+Transaction Cost / 交易成本:  $470K
 ```
+
+### v10 vs v8 Comparison | v10 与 v8 对比
+
+| Metric 指标 | v8 (WFO) | v10 (CPCV) | Change 变化 |
+|------|:---:|:---:|:---:|
+| Rank Correlation | 0.025 | **0.068** | +2.7x |
+| Total Return | +1.2% | **+58.0%** | +47x |
+| Sharpe Ratio | 0.08 | **0.38** | +4.8x |
+| OOS Coverage | 43,200 | **44,760** | 100% |
+| Bug: Lookahead | Yes (23-bar) | **Fixed** | - |
+| Bug: Boundary leak | Yes (0 embargo) | **Fixed** (48-bar) | - |
 
 ### Key Findings | 核心发现
 
-- **Crypto 1h cross-section is mean-reverting** (factor IC = -0.05), not momentum
-  加密货币 1h 横截面是均值回归市场（因子 IC = -0.05），而非动量市场
-- **Model rank_corr = 0.025 is the only profitable signal** — pure factor reversal loses -37%, pure momentum loses -25%, only the GRU+Attention model is net positive
-  模型的 rank_corr = 0.025 是唯一盈利信号——纯因子反转亏 -37%，纯动量亏 -25%，只有 GRU+Attention 模型净正
-- **Transaction costs dominate**: 48h holding lock reduced cost from $970K to $307K
-  交易成本是最大敌人：48h 持仓锁将成本从 $970K 降到 $307K
-- **Adverse selection is brutal**: 51% of limit order fills are adverse
-  逆向选择极其残酷：51% 的限价单成交都是逆向的（价格朝不利方向移动后成交）
+- **CPCV >> WFO**: 15-split CPCV with purge+embargo produces 2.7x better rank correlation than sequential WFO, because each fold trains on ~24K samples (vs 1.4K in WFO)
+  CPCV 远优于 WFO：每个 fold 训练 24K 样本（WFO 仅 1.4K），排名相关性提升 2.7 倍
+- **Bug fixes matter**: Removing the 23-bar lookahead changed results dramatically — v10 proves the alpha is real even without lookahead
+  Bug 修复至关重要：移除 23-bar 前视偏差后仍然盈利，证明 alpha 是真实的
+- **Crypto 1h cross-section is mean-reverting** (factor IC = -0.05), but the GRU+Attention model learns non-linear combinations that extract alpha from this reversal
+  加密货币 1h 横截面是均值回归市场，但 GRU+Attention 模型能从中提取非线性 alpha
+- **Adverse selection remains brutal**: 64% of fills are adverse, costing $470K — but gross alpha exceeds friction
+  逆向选择依然残酷：64% 成交为逆向，但毛利超过摩擦成本
 
 ---
 
@@ -155,13 +201,16 @@ polars
 pyarrow
 websockets
 aiohttp
+pyyaml
+dacite
+fastavro
 ```
 
 ### 1. Download Data | 下载数据
 
 ```bash
-# Bulk download 6 months of 5m klines from Binance archive
-# 从 Binance 公开归档批量下载6个月5分钟K线
+# Bulk download 6 months of 5m klines from Binance archive (886K rows, ~11s)
+# 从 Binance 归档批量下载6个月K线（88.6万行，约11秒）
 python data/archive_downloader.py
 
 # Or fetch via CCXT (works in geo-restricted regions)
@@ -169,32 +218,33 @@ python data/archive_downloader.py
 python data/async_feed.py
 ```
 
-### 2. Run the Full Pipeline | 运行完整管线
+### 2. Run v10 CPCV Pipeline (Recommended) | 运行 v10 CPCV 管线（推荐）
 
 ```bash
-# v8: Walk-Forward with 1M+ bars (recommended)
-# v8：100万+条数据的滚动回测（推荐）
-python run_v8_bigdata.py
+# v10: Combinatorial Purged CV with 15 splits (~30 min on RTX 5090)
+# v10：组合净化交叉验证，15个划分（RTX 5090 约30分钟）
+python run_v10_cpcv.py
 
-# v6: Low-frequency TWAP backtest on 1h bars
-# v6：1小时低频 TWAP 回测
-python run_v6_lowfreq.py
-
-# Hyperparameter grid search
-# 超参数网格搜索
-python hyperparam_search.py
+# Or with custom config
+# 或使用自定义配置
+python run_v10_cpcv.py --config configs/v10_cpcv.yaml
 ```
 
-### 3. Single-Asset Quick Test | 单资产快速测试
+### 3. Paper Trading | 模拟盘
 
 ```bash
-# Synthetic data + single Transformer (fast, good for understanding the codebase)
-# 合成数据 + 单 Transformer（速度快，适合理解代码结构）
-python main.py
+# Connect to live OKX WebSocket, run inference, simulate execution
+# 连接 OKX 实时行情，运行推理，模拟执行
+python run_paper.py
+```
 
-# BTC/USDT OOS test with real data
-# BTC/USDT 真实数据样本外测试
-python run_btc_oos.py
+### 4. Legacy Pipelines | 旧版管线
+
+```bash
+python run_v8_bigdata.py       # WFO with bug fixes / 修复后的WFO
+python run_v6_lowfreq.py       # Low-freq TWAP / 低频TWAP
+python hyperparam_search.py    # Grid search / 网格搜索
+python main.py                 # Single-asset synthetic / 单资产合成数据
 ```
 
 ---
@@ -203,37 +253,56 @@ python run_btc_oos.py
 
 ```
 quant-infra/
-├── engine/                        # Event-driven backtest core / 事件驱动回测核心
-│   ├── events.py                  # EventBus + 7 typed events / 事件总线 + 7种事件
-│   ├── order_book.py              # LOB matching engine / 限价指令簿撮合引擎
-│   ├── adverse_selection.py       # Micro-execution simulator / 逆向选择模拟器
-│   ├── twap_executor.py           # TWAP split-order execution / TWAP拆单执行
-│   ├── execution.py               # Kelly position sizing / Kelly仓位管理
-│   ├── portfolio.py               # Portfolio + metrics / 组合管理 + 绩效指标
-│   ├── risk.py                    # Drawdown circuit breaker / 回撤熔断器
-│   └── backtest.py                # Main event loop / 主事件循环
-├── model/                         # PyTorch models / PyTorch 模型
+├── config/                        # Config system / 配置系统
+│   ├── schema.py                  # 8 typed dataclasses / 8个类型化配置类
+│   └── __init__.py                # YAML loader / YAML加载器
+├── configs/
+│   └── v10_cpcv.yaml              # Default CPCV config / 默认CPCV配置
+├── engine/                        # Backtest core / 回测核心
+│   ├── cpcv.py                    # Combinatorial Purged CV / 组合净化交叉验证
+│   ├── events.py                  # EventBus + 7 events / 事件总线
+│   ├── order_book.py              # LOB matching / 撮合引擎
+│   ├── adverse_selection.py       # Adverse selection / 逆向选择
+│   ├── twap_executor.py           # TWAP execution / TWAP执行
+│   ├── execution.py               # Kelly sizing / Kelly仓位
+│   ├── portfolio.py               # Portfolio / 组合管理
+│   ├── risk.py                    # Risk manager / 风控
+│   └── backtest.py                # Event loop / 事件循环
+├── factors/                       # Plugin factor library / 插件化因子库
+│   ├── base.py                    # BaseFactor + FactorRegistry / 基类+注册表
+│   ├── log_return.py              # Log returns
+│   ├── sma_ratio.py               # SMA5/SMA20 ratios
+│   ├── ema_ratio.py               # EMA10 ratio
+│   ├── rsi.py                     # RSI
+│   ├── macd.py                    # MACD
+│   ├── bollinger.py               # Bollinger position
+│   ├── volume_zscore.py           # Volume z-score
+│   ├── trade_imbalance.py         # Trade imbalance (OBI)
+│   └── price_impact.py            # Amihud illiquidity
+├── model/                         # PyTorch models / 模型
+│   ├── cross_asset_attention.py   # GRU + cross-asset attention
 │   ├── transformer.py             # Encoder-Decoder Transformer
-│   ├── cross_asset_attention.py   # GRU + cross-asset attention / GRU + 跨资产注意力
-│   ├── cross_sectional.py         # 4D CrossSectional + ListMLE / 4D横截面 + 排序损失
-│   ├── features.py                # 10-factor engineering / 10因子工程
-│   ├── obi_features.py            # Order book imbalance / 订单簿不平衡度
-│   └── strategy.py                # Signal generation / 信号生成策略
+│   ├── cross_sectional.py         # 4D CrossSectional + ListMLE
+│   ├── features.py                # Feature pipeline / 因子管线
+│   ├── obi_features.py            # OBI features
+│   └── strategy.py                # Signal generation / 信号生成
+├── paper_trading/                 # Paper trading / 模拟盘
+│   ├── engine.py                  # Live inference engine / 实时推理引擎
+│   └── logger.py                  # SQLite logger / SQLite日志
 ├── data/                          # Data ingestion / 数据采集
 │   ├── archive_downloader.py      # Binance archive → Parquet
-│   ├── async_feed.py              # CCXT concurrent → SQLite
-│   ├── ws_daemon.py               # WebSocket real-time daemon / 实时WebSocket守护进程
-│   ├── lake_loader.py             # Parquet data lake loader / 数据湖加载器
-│   └── synthetic_lob.py           # Synthetic LOB generator / 合成LOB生成器
-├── main.py                        # Single-asset pipeline (v1-v3) / 单资产管线
-├── run_cross_sectional.py         # Multi-asset ranking (v4) / 多资产排序
-├── run_v5_final.py                # Adverse selection backtest / 逆向选择回测
-├── run_v6_lowfreq.py              # Low-freq TWAP + holding lock / 低频TWAP
-├── run_v7_wfo.py                  # Walk-Forward Optimization / 滚动优化
-├── run_v8_bigdata.py              # 1M+ bars WFO (main) / 百万级数据主管线
-├── run_v9_reversal.py             # Reversal signal analysis / 反转信号分析
-├── run_btc_oos.py                 # BTC OOS test / BTC样本外测试
+│   ├── async_feed.py              # CCXT → SQLite
+│   ├── avro_writer.py             # Avro streaming / Avro流式写入
+│   ├── ws_daemon.py               # WebSocket daemon
+│   ├── lake_loader.py             # Parquet loader / 数据湖加载
+│   └── synthetic_lob.py           # Synthetic data / 合成数据
+├── run_v10_cpcv.py                # v10 CPCV pipeline (main) / v10主管线
+├── run_paper.py                   # Paper trading entry / 模拟盘入口
+├── run_v8_bigdata.py              # v8 WFO (bug-fixed) / v8 WFO（已修复）
+├── run_v6_lowfreq.py              # v6 low-freq / v6低频
+├── run_v7_wfo.py                  # v7 WFO
 ├── hyperparam_search.py           # Grid search / 网格搜索
+├── main.py                        # Single-asset / 单资产
 └── requirements.txt
 ```
 
@@ -250,13 +319,13 @@ Developed and tested on / 开发和测试环境：
 
 ## References | 参考论文
 
-Architecture and methodology informed by / 架构和方法参考：
 - *Sentiment-Aware Stock Price Prediction with Transformer and LLM-Generated Formulaic Alpha* (arXiv 2508.04975)
 - *From Attention to Profit: Quantitative Trading Strategy Based on Transformer* (arXiv 2404.00424)
 - *Machine Learning Enhanced Multi-Factor Quantitative Trading* (arXiv 2507.07107)
 - *A Controlled Comparison of Deep Learning for Multi-Horizon Financial Forecasting* (arXiv 2603.16886)
 - *Exploring Microstructural Dynamics in Cryptocurrency LOBs* (arXiv 2506.05764)
 - *TLOB: Transformer with Dual Attention for LOB Price Prediction* (arXiv 2502.15757)
+- *Advances in Financial Machine Learning* — Marcos Lopez de Prado (CPCV methodology)
 
 ---
 

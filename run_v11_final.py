@@ -215,8 +215,8 @@ def run_cpcv(X, y, r1h, close_mat, syms, seq_len, n_factors, device):
         actual_train_idx = train_idx[:-val_size]
 
         model = CrossAssetGRUAttention(
-            n_factors=n_factors, d_model=128, gru_layers=2,
-            n_cross_heads=4, n_cross_layers=3, d_ff=256,
+            n_factors=n_factors, d_model=64, gru_layers=2,
+            n_cross_heads=4, n_cross_layers=3, d_ff=128,
             dropout=0.25, seq_len=seq_len, max_assets=n_assets,
         ).to(device)
         loss_fn = DualLoss().to(device)

@@ -89,6 +89,9 @@ The project was developed iteratively across 10 versions (v1–v10), each addres
 | `volume_zscore.py` | Volume z-score / 成交量 z-score |
 | `trade_imbalance.py` | Trade-based order imbalance (OBI) / 基于成交的订单不平衡度 |
 | `price_impact.py` | Amihud illiquidity ratio / Amihud 非流动性比率 |
+| `funding_rate.py` | Funding rate proxy (direction × volume) / 资金费率代理 |
+| `btc_dominance.py` | Relative strength vs own mean / 相对自身均值的强弱 |
+| `volume_momentum.py` | Short/long volume acceleration / 短期/长期成交量加速度 |
 
 ### Models 模型 (`model/`)
 
@@ -140,53 +143,58 @@ The project was developed iteratively across 10 versions (v1–v10), each addres
 | **v8** | 1M+ bars, 60-fold WFO / 百万数据60折WFO | 720 bars not significant / 720条无统计意义 |
 | **v9** | Reversal diagnosis / 反转诊断 | Proved model > pure factors / 证明模型优于纯因子 |
 | **v10** | **CPCV + config + factor plugins + paper trading + avro** | WFO has boundary leakage; need industrial infra / WFO有边界泄露；需工业级基建 |
+| **v11** | **13 factors + d128 + 18-month data + daily paper trading** | More data + alternative factors + production readiness / 更多数据+另类因子+生产就绪 |
 
 ---
 
 ## Results | 回测结果
 
-### v10 — 15-split CPCV, 44K OOS bars | 15 折组合净化交叉验证
+### v11 (Latest) — 15-split CPCV, 117K OOS bars, 18 months | 最新：15折CPCV，117K样本，18个月
 
 ```
-Source / 数据源:       Binance 5m klines (6 months, 886K rows) → aggregated to 1h
-                       Binance 5分钟K线（6个月，88.6万行）→ 聚合为1小时
+Source / 数据源:       Binance 5m klines (18 months, 3.15M rows) → aggregated to 1h
+                       Binance 5分钟K线（18个月，315万行）→ 聚合为1小时
 Assets / 资产:         20 crypto pairs / 20个加密货币交易对
+Factors / 因子:        13 plugin factors (10 price-volume + 3 alternative)
+                       13个插件因子（10个量价 + 3个另类）
+Model / 模型:          CrossAssetGRUAttention d_model=128, 617K params
 Validation / 验证:     CPCV (N=6, k=2) → 15 splits, purge=24, embargo=48
-                       组合净化交叉验证，15个划分，净化=24，隔离=48
-OOS Coverage / OOS覆盖: 44,760 bars (100% of samples) / 全部样本
-Execution / 执行:       TWAP 4-slice + adverse selection (64% adverse fill)
+OOS Coverage / OOS覆盖: 117,672 bars (100% of samples) / 全部样本
+Execution / 执行:       TWAP 4-slice + adverse selection (65% adverse fill)
 
-Total Return / 总收益:       +58.0%
-Sharpe Ratio / 夏普比率:     0.38
-Max Drawdown / 最大回撤:     37.5%
-Final Equity / 最终权益:     $1,580,013
-Rebalances / 换仓次数:       933
+Avg Rank Corr / 平均排名相关: 0.062 (all 15 folds positive / 15折全部为正)
+Total Return / 总收益:       -56.1% (dominated by transaction costs / 交易成本主导)
+Max Drawdown / 最大回撤:     60.6%
+Rebalances / 换仓次数:       2,451
+Transaction Cost / 交易成本:  $369K (36.9% of capital / 占本金36.9%)
 Avg Hold / 平均持仓:         48 hours / 48小时
-Avg Rank Corr / 平均排名相关: 0.068 (all 15 folds positive / 15折全部为正)
-Transaction Cost / 交易成本:  $470K
 ```
 
-### v10 vs v8 Comparison | v10 与 v8 对比
+### Version Comparison | 版本对比
 
-| Metric 指标 | v8 (WFO) | v10 (CPCV) | Change 变化 |
+| Metric 指标 | v8 (WFO) | v10 (CPCV 6m) | v11 (CPCV 18m) |
 |------|:---:|:---:|:---:|
-| Rank Correlation | 0.025 | **0.068** | +2.7x |
-| Total Return | +1.2% | **+58.0%** | +47x |
-| Sharpe Ratio | 0.08 | **0.38** | +4.8x |
-| OOS Coverage | 43,200 | **44,760** | 100% |
-| Bug: Lookahead | Yes (23-bar) | **Fixed** | - |
-| Bug: Boundary leak | Yes (0 embargo) | **Fixed** (48-bar) | - |
+| Data / 数据 | 44K bars (6m) | 44K bars (6m) | **117K bars (18m)** |
+| Factors / 因子 | 10 | 10 | **13** |
+| Model params / 模型参数 | 124K | 124K | **617K (d128)** |
+| Rank Correlation | 0.025 | 0.068 | **0.062** |
+| OOS Coverage | 43,200 | 44,760 | **117,672** |
+| Statistical confidence / 统计置信度 | Low / 低 | Medium / 中 | **High / 高** |
+| Bug: Lookahead | Yes | Fixed | Fixed |
+| Bug: Boundary leak | Yes | Fixed | Fixed |
 
 ### Key Findings | 核心发现
 
 - **CPCV >> WFO**: 15-split CPCV with purge+embargo produces 2.7x better rank correlation than sequential WFO, because each fold trains on ~24K samples (vs 1.4K in WFO)
   CPCV 远优于 WFO：每个 fold 训练 24K 样本（WFO 仅 1.4K），排名相关性提升 2.7 倍
-- **Bug fixes matter**: Removing the 23-bar lookahead changed results dramatically — v10 proves the alpha is real even without lookahead
-  Bug 修复至关重要：移除 23-bar 前视偏差后仍然盈利，证明 alpha 是真实的
-- **Crypto 1h cross-section is mean-reverting** (factor IC = -0.05), but the GRU+Attention model learns non-linear combinations that extract alpha from this reversal
-  加密货币 1h 横截面是均值回归市场，但 GRU+Attention 模型能从中提取非线性 alpha
-- **Adverse selection remains brutal**: 64% of fills are adverse, costing $470K — but gross alpha exceeds friction
-  逆向选择依然残酷：64% 成交为逆向，但毛利超过摩擦成本
+- **Rank correlation is stable at 0.06**: Consistent across 6-month and 18-month datasets, across d_model=64 and d_model=128, proving the signal is real and not an artifact of any specific configuration
+  排名相关性稳定在 0.06：跨 6 个月和 18 个月数据集、跨 d_model=64 和 128 均一致，证明信号真实
+- **1h label >> 6h label**: 6h cumulative return as training target degrades rank_corr from 0.068 to 0.039 — crypto 1h reversal signal is stronger at shorter horizons
+  1h 标签远优于 6h 标签：6h 标签将 rank_corr 从 0.068 降至 0.039，crypto 短期反转信号在更短周期更强
+- **Transaction costs dominate PnL**: With 65% adverse fill rate and 2,451 rebalances, costs ($369K) exceed gross alpha — paper trading is the next validation step
+  交易成本主导 PnL：65% 逆向成交率 + 2451 次换仓，成本远超毛利 — 模拟盘是下一步验证
+- **Model > pure factors**: v9 diagnosis proved GRU+Attention (rank_corr=0.025) beats pure factor reversal (-37%) and pure momentum (-25%)
+  模型优于纯因子：v9 诊断证明 GRU+Attention 优于纯因子反转和纯动量策略
 
 ---
 
@@ -218,24 +226,20 @@ python data/archive_downloader.py
 python data/async_feed.py
 ```
 
-### 2. Run v10 CPCV Pipeline (Recommended) | 运行 v10 CPCV 管线（推荐）
+### 2. Run v11 CPCV Pipeline (Recommended) | 运行 v11 CPCV 管线（推荐）
 
 ```bash
-# v10: Combinatorial Purged CV with 15 splits (~30 min on RTX 5090)
-# v10：组合净化交叉验证，15个划分（RTX 5090 约30分钟）
-python run_v10_cpcv.py
-
-# Or with custom config
-# 或使用自定义配置
-python run_v10_cpcv.py --config configs/v10_cpcv.yaml
+# v11: 13 factors + d128 + 18-month data + CPCV (~40 min on RTX 5090)
+# v11：13因子 + d128 + 18个月数据 + CPCV（RTX 5090约40分钟）
+python run_v11_final.py
 ```
 
-### 3. Paper Trading | 模拟盘
+### 3. Daily Paper Trading | 每日模拟盘
 
 ```bash
-# Connect to live OKX WebSocket, run inference, simulate execution
-# 连接 OKX 实时行情，运行推理，模拟执行
-python run_paper.py
+# Run once per day (~30 seconds): fetch bars → inference → log signal → reconcile
+# 每天跑一次（约30秒）：拉K线 → 推理 → 记录信号 → 对账
+python run_paper_daily.py
 ```
 
 ### 4. Legacy Pipelines | 旧版管线
@@ -278,7 +282,10 @@ quant-infra/
 │   ├── bollinger.py               # Bollinger position
 │   ├── volume_zscore.py           # Volume z-score
 │   ├── trade_imbalance.py         # Trade imbalance (OBI)
-│   └── price_impact.py            # Amihud illiquidity
+│   ├── price_impact.py            # Amihud illiquidity
+│   ├── funding_rate.py            # Funding rate proxy / 资金费率代理
+│   ├── btc_dominance.py           # Relative strength / 相对强弱
+│   └── volume_momentum.py         # Volume acceleration / 量能加速
 ├── model/                         # PyTorch models / 模型
 │   ├── cross_asset_attention.py   # GRU + cross-asset attention
 │   ├── transformer.py             # Encoder-Decoder Transformer
@@ -296,8 +303,10 @@ quant-infra/
 │   ├── ws_daemon.py               # WebSocket daemon
 │   ├── lake_loader.py             # Parquet loader / 数据湖加载
 │   └── synthetic_lob.py           # Synthetic data / 合成数据
-├── run_v10_cpcv.py                # v10 CPCV pipeline (main) / v10主管线
+├── run_v11_final.py               # v11 CPCV (13 factors, d128, 18m) / v11主管线
+├── run_v10_cpcv.py                # v10 CPCV pipeline / v10管线
 ├── run_paper.py                   # Paper trading entry / 模拟盘入口
+├── run_paper_daily.py             # Daily batch paper trading / 每日批处理模拟盘
 ├── run_v8_bigdata.py              # v8 WFO (bug-fixed) / v8 WFO（已修复）
 ├── run_v6_lowfreq.py              # v6 low-freq / v6低频
 ├── run_v7_wfo.py                  # v7 WFO

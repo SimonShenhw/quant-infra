@@ -293,6 +293,7 @@ def run_cpcv(X, y, r1h, close_mat, syms, seq_len, n_factors, device):
         if cl >= 0: pr += 0.5 * returns[cl].item()
         if cs >= 0: pr -= 0.5 * returns[cs].item()
         pr -= cost_bar / max(equity, 1.0)
+        pr = max(min(pr, 0.10), -0.10)  # clamp ±10% per bar to prevent compounding explosion / 限制单bar±10%防止复利爆炸
         equity *= (1.0 + pr)
         eq_curve.append(equity); hc += 1
 

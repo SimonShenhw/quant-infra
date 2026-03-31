@@ -93,33 +93,23 @@ def build_from_parquet(
             zscore_window=48,
         )
 
-    # 6-bar forward cumulative return (for TRAINING labels) / 6bar前瞻累计收益（训练标签）
-    fwd_ret = torch.zeros(min_len, len(syms), device=device)
-    for j in range(len(syms)):
-        c = close_mat[:, j]
-        fwd_ret[:min_len - fwd_horizon, j] = (
-            c[fwd_horizon:] / c[:min_len - fwd_horizon].clamp(min=1e-8) - 1.0
-        )
-
-    # 1-bar return (for BACKTEST PnL) / 1bar收益（回测PnL用）
+    # 1-bar forward return (for BOTH training and backtest) / 1bar前瞻收益（训练和回测共用）
     ret_1h = torch.zeros(min_len, len(syms), device=device)
     for j in range(len(syms)):
         c = close_mat[:, j]
         ret_1h[:-1, j] = c[1:] / c[:-1].clamp(min=1e-8) - 1.0
 
     # sliding windows / 滑动窗口
-    n_samples = min_len - seq_len - fwd_horizon
-    X_list, y_list, r1h_list = [], [], []
+    n_samples = min_len - seq_len - 1
+    X_list, y_list = [], []
     for i in range(n_samples):
         X_list.append(torch.stack([all_factors[s][i:i+seq_len] for s in syms], dim=0))
-        y_list.append(fwd_ret[i + seq_len - 1])
-        r1h_list.append(ret_1h[i + seq_len - 1])
+        y_list.append(ret_1h[i + seq_len - 1])
 
     X = torch.stack(X_list)
-    y = torch.stack(y_list)          # 6h label for training / 6h标签用于训练
-    r1h = torch.stack(r1h_list)      # 1h return for backtest / 1h收益用于回测
-    print(f"  X: {X.shape}, y: {y.shape}, r1h: {r1h.shape}, fwd_horizon={fwd_horizon}h")
-    return X, y, r1h, close_mat, syms, n_factors
+    y = torch.stack(y_list)  # 1h label for both training and backtest / 1h标签（训练+回测共用）
+    print(f"  X: {X.shape}, y: {y.shape}, label=1h return")
+    return X, y, y, close_mat, syms, n_factors  # r1h = y (same) / r1h=y（相同）
 
 
 # ============================================================================
@@ -330,10 +320,8 @@ def main():
 
     SEQ_LEN = 24
     MAX_ASSETS = 20
-    FWD_HORIZON = 6  # predict 6h cumulative return / 预测6h累计收益
-
     X, y, r1h, close_mat, syms, n_factors = build_from_parquet(
-        SEQ_LEN, MAX_ASSETS, device, fwd_horizon=FWD_HORIZON,
+        SEQ_LEN, MAX_ASSETS, device,
     )
 
     summary = run_cpcv(X, y, r1h, close_mat, syms, SEQ_LEN, n_factors, device)
@@ -342,7 +330,7 @@ def main():
     print("  v11.0 BACKTEST REPORT")
     print("=" * 65)
     print(f"  {'Factors':.<40s} {n_factors} (13 plugin)")
-    print(f"  {'Label Horizon':.<40s} {FWD_HORIZON}h cumulative return")
+    print(f"  {'Label':.<40s} 1h forward return")
     print(f"  {'CPCV Splits':.<40s} {summary['n_splits']}")
     print(f"  {'Samples':.<40s} {summary['n_samples']:,}")
     print(f"  {'Avg Rank Corr':.<40s} {summary['avg_corr']:.4f}")

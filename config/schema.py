@@ -36,11 +36,11 @@ class FeatureConfig:
 @dataclass
 class ModelConfig:
     """Model architecture configuration. / 模型架构配置。"""
-    d_model: int = 64
+    d_model: int = 128
     gru_layers: int = 2
     n_cross_heads: int = 4
     n_cross_layers: int = 2
-    d_ff: int = 128
+    d_ff: int = 256
     dropout: float = 0.25
     seq_len: int = 24
     max_assets: int = 20

@@ -118,7 +118,7 @@ def build_from_parquet(
 # Train fold
 # ============================================================================
 
-def train_fold(model, loss_fn, X_tr, y_tr, X_va, y_va, epochs=60, bs=64, lr=3e-4):
+def train_fold(model, loss_fn, X_tr, y_tr, X_va, y_va, epochs=60, bs=512, lr=3e-4):
     device = X_tr.device
     params = list(model.parameters()) + list(loss_fn.parameters())
     opt = optim.AdamW(params, lr=lr, weight_decay=1e-4)

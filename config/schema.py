@@ -63,7 +63,7 @@ class CVConfig:
 class TrainConfig:
     """Training configuration. / 训练配置。"""
     epochs: int = 60
-    batch_size: int = 64
+    batch_size: int = 512
     lr: float = 3e-4
     weight_decay: float = 1e-4
     patience: int = 12

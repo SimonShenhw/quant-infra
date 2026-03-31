@@ -183,8 +183,8 @@ def run_cpcv(X, y, close_mat, syms, seq_len, n_factors, device):
         actual_train_idx = train_idx[:-val_size]
 
         model = CrossAssetGRUAttention(
-            n_factors=n_factors, d_model=128, gru_layers=2,
-            n_cross_heads=4, n_cross_layers=2, d_ff=256,
+            n_factors=n_factors, d_model=64, gru_layers=2,
+            n_cross_heads=4, n_cross_layers=3, d_ff=128,
             dropout=0.25, seq_len=seq_len, max_assets=n_assets,
         ).to(device)
         loss_fn = DualLoss().to(device)
@@ -205,6 +205,7 @@ def run_cpcv(X, y, close_mat, syms, seq_len, n_factors, device):
 
         if (fi + 1) % 5 == 0 or fi == 0:
             print(f"  Split {fi+1}/{len(splits)}: corr={corr:.4f} [{time.time()-t0:.0f}s]")
+        del model, loss_fn  # free model before next fold / 释放模型以回收显存
         torch.cuda.empty_cache()
 
     valid_mask = pred_count > 0

@@ -118,8 +118,23 @@ def build_from_parquet(
 # Train fold
 # ============================================================================
 
-def train_fold(model, loss_fn, X_tr, y_tr, X_va, y_va, epochs=60, bs=512, lr=3e-4):
-    device = X_tr.device
+def train_fold_indexed(
+    model, loss_fn,
+    X_all: Tensor, y_all: Tensor,
+    train_idx: np.ndarray, val_idx: np.ndarray,
+    epochs: int = 60, bs: int = 512, lr: float = 3e-4,
+):
+    """
+    Zero-copy training: index into X_all per-batch instead of copying entire X_tr.
+    零拷贝训练：按batch从X_all中索引，不复制整个X_tr。
+    Eliminates the ~1.2GB VRAM spike at fold start.
+    消除每个fold开始时的~1.2GB显存尖峰。
+    """
+    device = X_all.device
+    train_idx_t = torch.from_numpy(train_idx).to(device)
+    val_idx_t = torch.from_numpy(val_idx).to(device)
+    n_train = len(train_idx)
+
     params = list(model.parameters()) + list(loss_fn.parameters())
     opt = optim.AdamW(params, lr=lr, weight_decay=1e-4)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
@@ -128,20 +143,29 @@ def train_fold(model, loss_fn, X_tr, y_tr, X_va, y_va, epochs=60, bs=512, lr=3e-
 
     for ep in range(1, epochs + 1):
         model.train(); loss_fn.train()
-        idx = torch.randperm(X_tr.size(0), device=device)
-        for s in range(0, X_tr.size(0), bs):
-            e = min(s + bs, X_tr.size(0))
-            scores = model(X_tr[idx[s:e]])
-            loss = loss_fn(scores, y_tr[idx[s:e]])
+        perm = torch.randperm(n_train, device=device)
+        for s in range(0, n_train, bs):
+            e = min(s + bs, n_train)
+            batch_idx = train_idx_t[perm[s:e]]
+            # only copy bs samples (~26MB), not entire train set (~1.2GB)
+            # 每次仅复制bs个样本，而非整个训练集
+            scores = model(X_all[batch_idx])
+            loss = loss_fn(scores, y_all[batch_idx])
             opt.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(params, 1.0); opt.step()
         sched.step()
 
+        # validation: also chunk to avoid spike / 验证也分块避免尖峰
         model.eval()
         with torch.no_grad():
-            vs = model(X_va)
-            pr = vs.argsort(-1, descending=True).argsort(-1).float()
-            tr = y_va.argsort(-1, descending=True).argsort(-1).float()
+            val_scores_list = []
+            for vs in range(0, len(val_idx), bs):
+                ve = min(vs + bs, len(val_idx))
+                val_scores_list.append(model(X_all[val_idx_t[vs:ve]]))
+            vs_cat = torch.cat(val_scores_list, dim=0)
+            vy = y_all[val_idx_t]
+            pr = vs_cat.argsort(-1, descending=True).argsort(-1).float()
+            tr = vy.argsort(-1, descending=True).argsort(-1).float()
             pm, tm = pr.mean(-1, True), tr.mean(-1, True)
             cov = ((pr-pm)*(tr-tm)).sum(-1)
             corr = (cov / ((pr-pm).pow(2).sum(-1).sqrt()*(tr-tm).pow(2).sum(-1).sqrt()).clamp(1e-8)).mean().item()
@@ -190,18 +214,23 @@ def run_cpcv(X, y, close_mat, syms, seq_len, n_factors, device):
         loss_fn = DualLoss().to(device)
 
         t0 = time.time()
-        model, corr = train_fold(
-            model, loss_fn,
-            X[actual_train_idx], y[actual_train_idx],
-            X[val_idx], y[val_idx],
+        # zero-copy: pass indices, not sliced copies / 零拷贝：传索引而非切片拷贝
+        model, corr = train_fold_indexed(
+            model, loss_fn, X, y,
+            actual_train_idx, val_idx,
         )
         fold_corrs.append(corr)
 
+        # OOS prediction: also chunked to avoid VRAM spike / OOS预测也分块
         model.eval()
+        test_idx_t = torch.from_numpy(test_idx).to(device)
         with torch.no_grad():
-            scores = model(X[test_idx])
-            pred_matrix[test_idx] += scores
-            pred_count[test_idx] += 1
+            for ts in range(0, len(test_idx), 512):
+                te = min(ts + 512, len(test_idx))
+                chunk_idx = test_idx_t[ts:te]
+                chunk_scores = model(X[chunk_idx])
+                pred_matrix[chunk_idx] += chunk_scores
+                pred_count[chunk_idx] += 1
 
         if (fi + 1) % 5 == 0 or fi == 0:
             print(f"  Split {fi+1}/{len(splits)}: corr={corr:.4f} [{time.time()-t0:.0f}s]")

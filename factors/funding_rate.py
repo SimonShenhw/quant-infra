@@ -1,45 +1,49 @@
 """
 Funding Rate Factor — 资金费率因子。
 
-Crypto-specific: perpetual contract funding rate is a natural reversal signal.
-When funding is highly positive, longs are overcrowded → short signal.
-When negative, shorts are overcrowded → long signal.
+Perpetual futures funding rate: a crowd-pressure signal. Extreme positive
+funding = longs crowded (reversal short); extreme negative = shorts crowded
+(reversal long).
 
-加密货币专属：永续合约资金费率是天然反转信号。
-费率高正值 = 多头拥挤 → 做空信号；负值 = 空头拥挤 → 做多信号。
+永续合约资金费率：拥挤度信号。极端正值=多头拥挤（反转做空）；
+极端负值=空头拥挤（反转做多）。
 
-Since we only have spot OHLCV data, we approximate funding pressure using:
-  funding_proxy = (close - open) / ATR * volume_ratio
-This captures the directional pressure + leverage proxy.
+Real data is loaded from funding_rates.db (populated by
+data/funding_archive_downloader.py from data.binance.vision). The caller
+passes a pre-aligned 1h funding tensor via `extras["funding"]`.
 
-由于仅有现货OHLCV数据，我们用以下方式近似资金费率压力：
+If real data is unavailable, falls back to an OHLCV-derived proxy:
   funding_proxy = (close - open) / ATR * volume_ratio
 """
-from factors.base import BaseFactor, register_factor
-from model.features import compute_sma, compute_ema, _rolling_std
+from typing import Any, Dict, Optional
+
 import torch
 from torch import Tensor
 
+from factors.base import BaseFactor, register_factor
+from model.features import compute_sma, compute_ema
+
 
 @register_factor
-class FundingRateProxy(BaseFactor):
+class FundingRate(BaseFactor):
     name = "funding_rate"
 
     def compute(
-        self, open_: Tensor, high: Tensor, low: Tensor,
+        self,
+        open_: Tensor, high: Tensor, low: Tensor,
         close: Tensor, volume: Tensor,
+        extras: Optional[Dict[str, Any]] = None,
     ) -> Tensor:
-        # ATR proxy: rolling average of (high - low) / 真实波幅近似
-        tr: Tensor = high - low
-        atr: Tensor = compute_ema(tr, 14).clamp(min=1e-8)
+        # Real funding rate path (preferred) / 优先使用真实资金费率
+        if extras is not None and "funding" in extras:
+            f: Tensor = extras["funding"]
+            if f.numel() == close.numel():
+                return f.to(close.device, dtype=close.dtype)
 
-        # directional pressure: (close - open) / ATR / 方向压力
-        direction: Tensor = (close - open_) / atr
-
-        # volume intensity: volume / SMA(volume, 20) / 成交量强度
-        vol_sma: Tensor = compute_sma(volume, 20).clamp(min=1e-8)
-        vol_ratio: Tensor = volume / vol_sma
-
-        # combined: high direction + high volume = crowded trade / 组合：高方向+高量=拥挤交易
-        funding_proxy: Tensor = direction * vol_ratio
-        return funding_proxy
+        # Proxy fallback (OHLCV-only) / 后备 OHLCV proxy
+        tr = high - low
+        atr = compute_ema(tr, 14).clamp(min=1e-8)
+        direction = (close - open_) / atr
+        vol_sma = compute_sma(volume, 20).clamp(min=1e-8)
+        vol_ratio = volume / vol_sma
+        return direction * vol_ratio

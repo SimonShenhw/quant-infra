@@ -1,15 +1,25 @@
 """
-run_v11_final.py — 13 Factors + 6h Multi-Horizon Label + CPCV.
+run_v11_final.py — 17 Factors (4 noise-drop) + Real Funding Rate + CPCV.
+
+v11.1 changes vs v11.0:
+  - Dropped 4 noise factors by factor_analyzer IC ranking:
+    volume_zscore, volume_momentum, macd, klow (all |IC_1h| < 0.003)
+  - Real funding rate from funding_rates.db (Binance Vision archive),
+    8h cadence forward-filled to 1h bar timestamps
+  - Factor count: 21 -> 17
 
 v11 changes vs v10:
   - 13 factors (added funding_rate, btc_dominance, volume_momentum)
-  - 6-bar forward cumulative return as label (not 1-bar)
   - Uses FactorRegistry plugin system
+  - Label: 1h (1-bar) forward return for training and backtest
 """
 from __future__ import annotations
 
+import os
+import sqlite3
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -28,12 +38,19 @@ from factors.base import FactorRegistry
 from model.cross_asset_attention import CrossAssetGRUAttention
 from model.cross_sectional import listmle_loss
 
-# trigger auto-discover of all 13 factors / 触发13个因子的自动发现
+# trigger auto-discover of all factors / 触发所有因子的自动发现
 import factors  # noqa: F401
+
+# Factors to exclude based on factor_analyzer IC ranking (|IC_1h| < 0.003).
+# Rerun tools/factor_analyzer.py to refresh this list.
+# 基于 factor_analyzer IC 排名剔除的因子（|IC_1h| < 0.003）。
+DROP_FACTORS: set = {"volume_zscore", "volume_momentum", "macd", "klow"}
+
+FUNDING_DB: str = str(Path(__file__).resolve().parent / "funding_rates.db")
 
 
 # ============================================================================
-# Data: Parquet → aggregate → 13 factors + 6h label
+# Data: Parquet → aggregate → N factors (post-drop) + 1h label
 # ============================================================================
 
 def aggregate_5m_to_1h(df: pl.DataFrame) -> pl.DataFrame:
@@ -42,6 +59,37 @@ def aggregate_5m_to_1h(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("open").first(), pl.col("high").max(),
         pl.col("low").min(), pl.col("close").last(), pl.col("volume").sum(),
     ]).sort("hour_ts").rename({"hour_ts": "open_time"})
+
+
+def load_and_align_funding(
+    symbol: str, bar_times_ms: np.ndarray, device: torch.device,
+    db_path: str = FUNDING_DB,
+) -> Tensor:
+    """
+    Load funding rates for `symbol` from SQLite, forward-fill onto 1h bar
+    timestamps. Funding cadence is 8h so ~8 bars share the same rate.
+    Bars earlier than the first funding record get 0.0.
+
+    从 SQLite 加载资金费率并按 1h bar 时间戳前向填充。资金费率每 8 小时更新，
+    约 8 个 bar 共享同一费率。首条记录之前的 bar 填 0。
+    """
+    if not os.path.exists(db_path):
+        return torch.zeros(len(bar_times_ms), dtype=torch.float32, device=device)
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT ts_ms, rate FROM funding WHERE symbol=? ORDER BY ts_ms", (symbol,)
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return torch.zeros(len(bar_times_ms), dtype=torch.float32, device=device)
+    ts_arr = np.asarray([r[0] for r in rows], dtype=np.int64)
+    rate_arr = np.asarray([r[1] for r in rows], dtype=np.float32)
+    # for each bar time T, find last funding ts <= T / 前向填充
+    idx = np.searchsorted(ts_arr, bar_times_ms, side="right") - 1
+    out = np.zeros(len(bar_times_ms), dtype=np.float32)
+    valid = idx >= 0
+    out[valid] = rate_arr[idx[valid]]
+    return torch.from_numpy(out).to(device)
 
 
 class DualLoss(nn.Module):
@@ -67,7 +115,7 @@ def build_from_parquet(
     seq_len: int, max_assets: int, device: torch.device,
     fwd_horizon: int = 6,
 ) -> Tuple[Tensor, Tensor, Tensor, List[str], int]:
-    """Build 4D tensor with 13 plugin factors + 6h cumulative return label."""
+    """Build 4D tensor with FactorRegistry-discovered factors + 1h forward return label."""
     print("[Data] Loading from Parquet data lake ...")
     raw_5m = load_klines_multi(interval="5m", min_rows=40000)
     print(f"  Loaded {len(raw_5m)} symbols")
@@ -76,22 +124,37 @@ def build_from_parquet(
     agg_dfs = {sym: aggregate_5m_to_1h(raw_5m[sym]) for sym in syms}
     min_len = min(df.height for df in agg_dfs.values())
 
-    factor_names = FactorRegistry.list_factors()
+    # Filter out low-IC noise factors (see DROP_FACTORS at top of file)
+    # 按 IC 过滤掉低信号因子
+    all_registered = FactorRegistry.list_factors()
+    factor_names = [n for n in all_registered if n not in DROP_FACTORS]
     n_factors = len(factor_names)
-    print(f"  {len(syms)} assets, {min_len} 1h bars, {n_factors} factors: {factor_names}")
+    dropped = [n for n in all_registered if n in DROP_FACTORS]
+    print(f"  {len(syms)} assets, {min_len} 1h bars, {n_factors} factors")
+    print(f"    kept:    {factor_names}")
+    print(f"    dropped: {dropped}")
 
     close_mat = torch.zeros(min_len, len(syms), device=device)
     all_factors: Dict[str, Tensor] = {}
+    funding_coverage_nonzero: List[float] = []
 
     for j, sym in enumerate(syms):
         rows = agg_dfs[sym].head(min_len)
         t = klines_to_tensors(rows, device)
         close_mat[:, j] = t["close"]
-        # use FactorRegistry with all 13 factors / 使用13因子注册表
+        # Align real funding rate to 1h bar timestamps (8h cadence -> 1h, forward-fill)
+        # 将真实资金费率按 1h bar 时间戳对齐（8h 间隔 -> 1h 前向填充）
+        bar_times_ms = rows["open_time"].to_numpy().astype(np.int64)
+        funding_1h = load_and_align_funding(sym, bar_times_ms, device)
+        funding_coverage_nonzero.append((funding_1h != 0).float().mean().item())
         all_factors[sym] = FactorRegistry.build_tensor(
             factor_names, t["open"], t["high"], t["low"], t["close"], t["volume"],
             zscore_window=48,
+            extras={"funding": funding_1h},
         )
+
+    avg_cov = sum(funding_coverage_nonzero) / max(len(funding_coverage_nonzero), 1)
+    print(f"  Funding coverage: {avg_cov:.1%} of bars have real funding data")
 
     # 1-bar forward return (for BOTH training and backtest) / 1bar前瞻收益（训练和回测共用）
     ret_1h = torch.zeros(min_len, len(syms), device=device)
@@ -361,7 +424,7 @@ def run_cpcv(X, y, r1h, close_mat, syms, seq_len, n_factors, device):
 
 def main():
     print("=" * 65)
-    print("  v11.0 — 13 Factors + 6h Label + CPCV")
+    print("  v11.1 — 17 Factors (4-drop) + Real Funding + CPCV")
     print("=" * 65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -376,9 +439,9 @@ def main():
     summary = run_cpcv(X, y, r1h, close_mat, syms, SEQ_LEN, n_factors, device)
 
     print("\n" + "=" * 65)
-    print("  v11.0 BACKTEST REPORT")
+    print("  v11.1 BACKTEST REPORT")
     print("=" * 65)
-    print(f"  {'Factors':.<40s} {n_factors} (13 plugin)")
+    print(f"  {'Factors':.<40s} {n_factors}")
     print(f"  {'Label':.<40s} 1h forward return")
     print(f"  {'CPCV Splits':.<40s} {summary['n_splits']}")
     print(f"  {'Samples':.<40s} {summary['n_samples']:,}")

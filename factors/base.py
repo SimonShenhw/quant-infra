@@ -7,8 +7,9 @@ Each factor is an independent .py file with a class extending BaseFactor.
 """
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
-from typing import Dict, List, Type
+from typing import Any, Dict, List, Optional, Type
 
 import torch
 from torch import Tensor
@@ -80,10 +81,16 @@ class FactorRegistry:
         open_: Tensor, high: Tensor, low: Tensor,
         close: Tensor, volume: Tensor,
         zscore_window: int = 48,
+        extras: Optional[Dict[str, Any]] = None,
     ) -> Tensor:
         """
         Build factor tensor using named factors from registry.
         使用注册表中的命名因子构建因子张量。
+
+        `extras` is an optional per-symbol payload (e.g. pre-aligned funding rate
+        tensor) — forwarded only to factors whose compute() signature accepts it.
+        extras 是可选的逐 symbol 载荷（如预对齐的资金费率张量），只转发给
+        compute() 签名中声明接收它的因子。
 
         Returns (T, len(factor_names)) tensor, z-score normalized.
         返回 (T, len(factor_names)) 张量，经 z-score 归一化。
@@ -94,7 +101,12 @@ class FactorRegistry:
             if name not in _FACTOR_REGISTRY:
                 raise KeyError(f"Factor '{name}' not registered. Available: {list(_FACTOR_REGISTRY.keys())}")
             factor = _FACTOR_REGISTRY[name]()
-            raw = factor.compute(open_, high, low, close, volume)
+            # forward extras only if the factor's compute() declares it / 仅当因子声明接收时转发
+            sig = inspect.signature(factor.compute)
+            if extras is not None and "extras" in sig.parameters:
+                raw = factor.compute(open_, high, low, close, volume, extras=extras)
+            else:
+                raw = factor.compute(open_, high, low, close, volume)
             normalized = _rolling_zscore(raw, zscore_window)
             cols.append(normalized)
         result = torch.stack(cols, dim=-1)

@@ -240,6 +240,48 @@ def run_cpcv(X, y, r1h, close_mat, syms, seq_len, n_factors, device):
 
     print(f"\n[CPCV] Done in {time.time()-t0_total:.0f}s, avg corr={sum(fold_corrs)/len(fold_corrs):.4f}")
 
+    # ----- Train production model on ALL data + save checkpoint -----
+    # 用全部数据训练生产模型 + 保存checkpoint
+    print(f"\n[Production] Training final model on all {n_samples} samples ...")
+    prod_model = CrossAssetGRUAttention(
+        n_factors=n_factors, d_model=128, gru_layers=2,
+        n_cross_heads=4, n_cross_layers=3, d_ff=256,
+        dropout=0.30, seq_len=seq_len, max_assets=n_assets,
+    ).to(device)
+    prod_loss = DualLoss().to(device)
+    # last 10% as holdout val for early stopping / 末尾10%做早停
+    val_size = max(int(n_samples * 0.10), 100)
+    all_idx = np.arange(n_samples)
+    train_idx_prod = all_idx[:-val_size]
+    val_idx_prod = all_idx[-val_size:]
+    prod_t0 = time.time()
+    prod_model, prod_corr = train_fold_indexed(
+        prod_model, prod_loss, X, y,
+        train_idx_prod, val_idx_prod,
+    )
+    print(f"  Production model trained: corr={prod_corr:.4f} [{time.time()-prod_t0:.0f}s]")
+
+    # save checkpoint / 保存checkpoint
+    import os
+    ckpt_dir = "checkpoints"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, "v11_production.pt")
+    torch.save({
+        "model_state": prod_model.state_dict(),
+        "n_factors": n_factors,
+        "d_model": 128,
+        "gru_layers": 2,
+        "n_cross_heads": 4,
+        "n_cross_layers": 3,
+        "d_ff": 256,
+        "dropout": 0.30,
+        "seq_len": seq_len,
+        "max_assets": n_assets,
+        "val_corr": prod_corr,
+        "factor_names": FactorRegistry.list_factors(),
+    }, ckpt_path)
+    print(f"  Saved checkpoint: {ckpt_path}")
+
     # backtest / 回测
     twap = TWAPExecutor(n_slices=4, favorable_reject_rate=0.60)
     equity = 1_000_000.0

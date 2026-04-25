@@ -119,14 +119,31 @@ def run_inference(
 
     x = torch.stack(all_factors, dim=0).unsqueeze(0).to(device)  # (1, A, T, F)
 
-    # init model with random weights (in production: load checkpoint)
-    # 初始化随机权重模型（生产环境应加载checkpoint）
+    # Load trained checkpoint / 加载训练好的checkpoint
+    import os
+    ckpt_path = "checkpoints/v11_production.pt"
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {ckpt_path}\n"
+            f"Please run `python run_v11_final.py` first to train and save the model.\n"
+            f"未找到checkpoint。请先运行 run_v11_final.py 训练并保存模型。"
+        )
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = CrossAssetGRUAttention(
-        n_factors=len(factor_names), d_model=64, gru_layers=2,
-        n_cross_heads=4, n_cross_layers=2, d_ff=128,
-        dropout=0.0, seq_len=seq_len, max_assets=len(syms),
+        n_factors=ckpt["n_factors"],
+        d_model=ckpt["d_model"],
+        gru_layers=ckpt["gru_layers"],
+        n_cross_heads=ckpt["n_cross_heads"],
+        n_cross_layers=ckpt["n_cross_layers"],
+        d_ff=ckpt["d_ff"],
+        dropout=0.0,  # no dropout at inference / 推理时关闭dropout
+        seq_len=ckpt["seq_len"],
+        max_assets=ckpt["max_assets"],
     ).to(device)
+    model.load_state_dict(ckpt["model_state"])
     model.eval()
+    print(f"  Loaded checkpoint (val_corr={ckpt['val_corr']:.4f})")
 
     with torch.no_grad():
         scores = model(x).squeeze(0)

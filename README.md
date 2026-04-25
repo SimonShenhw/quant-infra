@@ -144,6 +144,7 @@ The project was developed iteratively across 10 versions (v1–v10), each addres
 | **v9** | Reversal diagnosis / 反转诊断 | Proved model > pure factors / 证明模型优于纯因子 |
 | **v10** | **CPCV + config + factor plugins + paper trading + avro** | WFO has boundary leakage; need industrial infra / WFO有边界泄露；需工业级基建 |
 | **v11** | **13 factors + d128 + 18-month data + daily paper trading** | More data + alternative factors + production readiness / 更多数据+另类因子+生产就绪 |
+| **v11.1** | **Checkpoint save/load + paper trading bug fix** | Discovered paper trading was running on RANDOM weights for 12 days (41.7% win rate ≈ random) / 发现 paper trading 跑了12天随机权重模型 |
 
 ---
 
@@ -195,6 +196,25 @@ Avg Hold / 平均持仓:         48 hours / 48小时
   交易成本主导 PnL：65% 逆向成交率 + 2451 次换仓，成本远超毛利 — 模拟盘是下一步验证
 - **Model > pure factors**: v9 diagnosis proved GRU+Attention (rank_corr=0.025) beats pure factor reversal (-37%) and pure momentum (-25%)
   模型优于纯因子：v9 诊断证明 GRU+Attention 优于纯因子反转和纯动量策略
+
+### v11.1 Bug Fix: Paper Trading Was Running Random Weights | v11.1 修复：模拟盘跑的是随机权重
+
+After 12 days of paper trading (Mar 30 – Apr 24), reviewing accumulated data revealed:
+- Win rate: **41.7%** (5W / 7L) — close to random baseline
+- Cumulative return: -0.74%
+- Sharpe: -0.15
+- Day-to-day volatility: 2.84% (way too high for market-neutral)
+
+Root cause: `run_paper_daily.py` initialized the model with **random weights** at every run instead of loading the trained checkpoint. The model was effectively a random number generator — explaining why results matched random chance.
+
+12天模拟盘数据的 review 揭露：胜率 41.7% 接近随机基准，累计 -0.74%，夏普 -0.15。
+根因：`run_paper_daily.py` 每次初始化随机权重而非加载训练好的checkpoint，模型实质上是随机数生成器，所以结果等同于随机选择。
+
+**Fix in v11.1 / 修复方案**:
+- `run_v11_final.py` now trains a final production model on all data and saves checkpoint to `checkpoints/v11_production.pt`
+- `run_paper_daily.py` now loads that checkpoint at inference time
+- Old `paper_daily.db` archived as `paper_daily_random_weights_backup.db`
+- Need to retrain (run_v11_final.py once) before next paper trading session
 
 ---
 

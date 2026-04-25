@@ -6,6 +6,9 @@
 *.h5
 *.hdf5
 data_lake/
+checkpoints/
+*.pt
+*.pth
 
 # Python
 __pycache__/

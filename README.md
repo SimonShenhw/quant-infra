@@ -92,6 +92,8 @@ The project was developed iteratively across 10 versions (v1–v10), each addres
 | `funding_rate.py` | Funding rate proxy (direction × volume) / 资金费率代理 |
 | `btc_dominance.py` | Relative strength vs own mean / 相对自身均值的强弱 |
 | `volume_momentum.py` | Short/long volume acceleration / 短期/长期成交量加速度 |
+| `qlib_pack.py` | **8 Qlib-inspired factors**: kmid, klen, kup, klow, roc10, corr_pv, std20, max20_ratio |
+| `multi_timeframe.py` | Multi-TF wrapper: factors at 1h+4h+24h scales / 多时间尺度因子封装 |
 
 ### Models 模型 (`model/`)
 
@@ -126,6 +128,23 @@ The project was developed iteratively across 10 versions (v1–v10), each addres
 |--------|-------------|
 | `engine.py` | Live bar ingestion → inference → simulated execution / 实时K线 → 推理 → 模拟执行 |
 | `logger.py` | SQLite logger: signals, fills, equity snapshots / SQLite 日志 |
+| `realtime_feed.py` | **Binance WebSocket** kline feed (replaces 6s REST) / WebSocket 实时K线 |
+
+### Tools 分析工具 (`tools/`)
+
+| Module 模块 | Description 描述 |
+|--------|-------------|
+| `factor_analyzer.py` | **Alphalens-style** IC analysis across 1h/6h/24h/48h horizons / 因子IC分析 |
+
+### v11.2 New Modules | v11.2 新增模块
+
+| Module 模块 | Description 描述 |
+|--------|-------------|
+| `data/funding_fetcher.py` | Binance Futures **real funding rate** historical API / 真实资金费率 |
+| `data/onchain_fetcher.py` | Coinmetrics community on-chain metrics (free) / 链上指标（免费） |
+| `engine/numba_backtest.py` | **Numba JIT** backtest loop (~50x faster) / Numba加速回测 |
+| `engine/adaptive_sizing.py` | RL-inspired Kelly with drawdown awareness / 自适应Kelly仓位 |
+| `model/patch_tst.py` | **PatchTST** alternative (ICLR 2023) cross-asset variant / PatchTST模型 |
 
 ---
 
@@ -145,6 +164,7 @@ The project was developed iteratively across 10 versions (v1–v10), each addres
 | **v10** | **CPCV + config + factor plugins + paper trading + avro** | WFO has boundary leakage; need industrial infra / WFO有边界泄露；需工业级基建 |
 | **v11** | **13 factors + d128 + 18-month data + daily paper trading** | More data + alternative factors + production readiness / 更多数据+另类因子+生产就绪 |
 | **v11.1** | **Checkpoint save/load + paper trading bug fix** | Discovered paper trading was running on RANDOM weights for 12 days (41.7% win rate ≈ random) / 发现 paper trading 跑了12天随机权重模型 |
+| **v11.2** | **10-feature optimization sweep** | Major upgrade: 21 factors, fold ensemble, Numba backtest, PatchTST, multi-TF, real funding rate, on-chain data, WS feed, adaptive Kelly, factor IC analyzer / 21因子+折集成+Numba回测+PatchTST等 |
 
 ---
 

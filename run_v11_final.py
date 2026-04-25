@@ -232,6 +232,13 @@ def run_cpcv(X, y, r1h, close_mat, syms, seq_len, n_factors, device):
 
         if (fi + 1) % 5 == 0 or fi == 0:
             print(f"  Split {fi+1}/{len(splits)}: corr={corr:.4f} [{time.time()-t0:.0f}s]")
+
+        # Save fold checkpoint for ensemble inference / 保存fold模型用于集成推理
+        import os as _os
+        _os.makedirs("checkpoints/folds", exist_ok=True)
+        torch.save({"state": model.state_dict(), "corr": corr},
+                   f"checkpoints/folds/fold_{fi:02d}.pt")
+
         del model, loss_fn  # free model before next fold / 释放模型以回收显存
         torch.cuda.empty_cache()
 

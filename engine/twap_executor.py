@@ -61,11 +61,35 @@ class TWAPExecutor:
         favorable_reject_rate: float = 0.60,
         taker_fee_bps: float = 4.0,
         maker_fee_bps: float = 1.0,
+        slippage_adverse_bps: float = 5.0,
+        slippage_taker_bps: float = 2.0,
+        slippage_maker_bps: float = 0.0,
     ) -> None:
+        """
+        slippage_*_bps: extra cost per fill type, on top of the exchange fee.
+
+        - slippage_adverse_bps: charged when limit fills against you (price
+          moved adversely, you got the bad-side fill). Default 5 bps ~ half a
+          typical 1-bar realized spread for liquid USDT perps under stress.
+        - slippage_taker_bps: charged when a favorable maker is rejected and
+          you chase as taker. Default 2 bps for the chase cost.
+        - slippage_maker_bps: charged on lucky maker fills (you got the limit
+          price). Default 0 — you got what you wanted.
+
+        Set all three to 0.0 for the legacy "fees-only" backtest behavior.
+        Set higher to stress-test under wider effective spreads.
+
+        slippage_*_bps：每种 fill 类型在交易所手续费之外的额外成本（基点）。
+        默认 5/2/0 模拟"诚实"adverse selection 损失。全设 0 退化为 v11/v12
+        早期 backtest 的纯手续费模式。
+        """
         self._n_slices: int = n_slices
         self._fav_reject: float = favorable_reject_rate
         self._taker_bps: float = taker_fee_bps
         self._maker_bps: float = maker_fee_bps
+        self._slip_adv: float = slippage_adverse_bps
+        self._slip_tkr: float = slippage_taker_bps
+        self._slip_mkr: float = slippage_maker_bps
 
         # stats / 统计
         self.total_slices: int = 0
@@ -135,22 +159,23 @@ class TWAPExecutor:
                 # favorable move — high reject probability / 有利变动 - 高拒绝概率
                 if random.random() < self._fav_reject:
                     self.rejected_slices += 1
-                    # use taker at current bar close (worse price, but filled) / 以当前K线收盘价 Taker 成交（价格更差，但保证成交）
+                    # rejected favorable, chase as taker / 拒绝后追单 taker
                     filled_notional += slice_notional
                     weighted_price += slice_notional * bar_close
-                    total_cost += slice_notional * self._taker_bps / 10000.0
+                    total_cost += slice_notional * (self._taker_bps + self._slip_tkr) / 10000.0
                     self.taker_fills += 1
                 else:
                     # lucky maker fill at limit / 幸运地以限价 Maker 成交
                     filled_notional += slice_notional
                     weighted_price += slice_notional * limit_price
-                    total_cost += slice_notional * self._maker_bps / 10000.0
+                    total_cost += slice_notional * (self._maker_bps + self._slip_mkr) / 10000.0
                     self.maker_fills += 1
             else:
-                # adverse move — guaranteed fill at limit price / 不利变动 - 以限价保证成交
+                # adverse move — limit hit on the wrong side (you bought high / sold low)
+                # 不利变动 - 限价被打中（你贵买便宜卖），收 adverse-selection 滑点
                 filled_notional += slice_notional
                 weighted_price += slice_notional * limit_price
-                total_cost += slice_notional * self._maker_bps / 10000.0
+                total_cost += slice_notional * (self._maker_bps + self._slip_adv) / 10000.0
                 self.adverse_fills += 1
 
         avg_price: float = weighted_price / max(filled_notional, 1e-8)

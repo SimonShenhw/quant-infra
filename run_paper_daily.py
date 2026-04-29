@@ -4,17 +4,19 @@ run_paper_daily.py — Daily batch paper trading.
 
 Run once per day (~30 seconds):
   1. Fetch latest 48h of 1h bars for 20 assets via CCXT
-  2. Compute 13 factors + model inference
-  3. Output today's long/short recommendation
-  4. Compare yesterday's recommendation vs actual returns (reconciliation)
+  2. Build factor tensor using checkpoint's saved factor_names (post-drop)
+  3. Model inference + emit today's long/short pick
+  4. Reconcile yesterday's signal vs realized returns
   5. Log everything to SQLite
 
-每天运行一次（约30秒）：
-  1. 通过CCXT获取20个资产最近48h的1h K线
-  2. 计算13因子 + 模型推理
-  3. 输出今日多/空建议
-  4. 对比昨日建议 vs 实际收益（对账）
-  5. 全部记录到SQLite
+Compatibility:
+  - v12 (default): loads checkpoints/v12_production.pt; 17 factors
+  - v11.1: pass --ckpt v11 to load checkpoints/v11_production.pt
+
+Known caveats (TODO):
+  - funding_rate factor falls back to OHLCV proxy here (no extras passed),
+    while v11.1+/v12 trained on REAL Binance Vision funding. Slight domain
+    shift. To fix: fetch live funding via CCXT and pass extras={"funding":...}
 """
 from __future__ import annotations
 
@@ -94,18 +96,56 @@ def fetch_bars(symbols: List[str], n_bars: int = 50) -> Dict[str, List[Tuple]]:
     return result
 
 
+# Match the noise factors dropped by v11.1+/v12 training (run_v11_final.py /
+# run_v12_final.py). Used as fallback if the checkpoint doesn't carry a
+# factor_names list. Keep in sync if training drops change.
+# 与 v11.1+/v12 训练脚本剔除的因子保持一致；若 ckpt 自带 factor_names 优先用它。
+DROP_FACTORS_FALLBACK = {"volume_zscore", "volume_momentum", "macd", "klow"}
+
+
+def _resolve_factor_names(ckpt: dict) -> List[str]:
+    """Pick the factor list that matches the checkpoint's n_factors.
+    选用与 ckpt 的 n_factors 匹配的因子列表。"""
+    n_expected = int(ckpt["n_factors"])
+    saved = ckpt.get("factor_names")
+    if isinstance(saved, list) and len(saved) == n_expected:
+        return list(saved)
+    # fallback: drop the noise factors and confirm the count matches
+    fallback = [n for n in FactorRegistry.list_factors() if n not in DROP_FACTORS_FALLBACK]
+    if len(fallback) == n_expected:
+        return fallback
+    raise RuntimeError(
+        f"Cannot resolve factor list: ckpt expects {n_expected} factors, "
+        f"saved factor_names has {len(saved) if saved else 'None'}, "
+        f"fallback (after drops) has {len(fallback)}. "
+        f"Update DROP_FACTORS_FALLBACK in run_paper_daily.py."
+    )
+
+
 def run_inference(
-    bars: Dict[str, List[Tuple]], device: torch.device, seq_len: int = 24
+    bars: Dict[str, List[Tuple]], device: torch.device,
+    seq_len: int = 24, ckpt_path: str = "checkpoints/v12_production.pt",
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """Run model inference on latest bars. Returns (scores, closes). / 对最新K线运行推理。"""
     syms = sorted(bars.keys())
     if len(syms) < 5:
         raise ValueError(f"Only {len(syms)} symbols, need >= 5")
 
-    factor_names = FactorRegistry.list_factors()
+    # Load trained checkpoint FIRST so we know which factors to build
+    # 先加载 ckpt，从中读出真正训练用的因子列表
+    import os
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {ckpt_path}\n"
+            f"Run `python run_v12_final.py` to train, or pass --ckpt v11 to use v11.1.\n"
+            f"未找到 checkpoint。请先运行 run_v12_final.py 训练，或用 --ckpt v11 加载 v11.1。"
+        )
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    factor_names = _resolve_factor_names(ckpt)
+    print(f"  Loaded {ckpt_path} (val_corr={ckpt['val_corr']:.4f}, {len(factor_names)} factors)")
+
     all_factors = []
     closes = {}
-
     for sym in syms:
         b = bars[sym]
         o = torch.tensor([x[0] for x in b], dtype=torch.float32, device=device)
@@ -119,17 +159,6 @@ def run_inference(
 
     x = torch.stack(all_factors, dim=0).unsqueeze(0).to(device)  # (1, A, T, F)
 
-    # Load trained checkpoint / 加载训练好的checkpoint
-    import os
-    ckpt_path = "checkpoints/v11_production.pt"
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {ckpt_path}\n"
-            f"Please run `python run_v11_final.py` first to train and save the model.\n"
-            f"未找到checkpoint。请先运行 run_v11_final.py 训练并保存模型。"
-        )
-
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = CrossAssetGRUAttention(
         n_factors=ckpt["n_factors"],
         d_model=ckpt["d_model"],
@@ -143,7 +172,6 @@ def run_inference(
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-    print(f"  Loaded checkpoint (val_corr={ckpt['val_corr']:.4f})")
 
     with torch.no_grad():
         scores = model(x).squeeze(0)
@@ -194,9 +222,17 @@ def reconcile(conn: sqlite3.Connection, bars: Dict[str, List[Tuple]]) -> Optiona
 
 
 def main():
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--ckpt", default="v12",
+                   help="model version: 'v12' (default) or 'v11' (loads checkpoints/<v>_production.pt)")
+    args = p.parse_args()
+    ckpt_path = f"checkpoints/{args.ckpt}_production.pt"
+
     print("=" * 60)
     print("  Daily Paper Trading — Batch Mode")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Model: {ckpt_path}")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -220,7 +256,7 @@ def main():
 
     # Step 3: Run inference / 运行推理
     print("\n[3/4] Running model inference ...")
-    score_dict, closes = run_inference(bars, device)
+    score_dict, closes = run_inference(bars, device, ckpt_path=ckpt_path)
     sorted_scores = sorted(score_dict.items(), key=lambda x: x[1], reverse=True)
     long_asset = sorted_scores[0][0]
     short_asset = sorted_scores[-1][0]

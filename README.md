@@ -12,9 +12,9 @@ A complete quantitative trading infrastructure covering the full pipeline: **dat
 
 完整的量化交易基础设施，覆盖全链路：**数据采集 → 因子工程 → 模型训练 → 信号生成 → 订单执行 → 组合管理 → 绩效分析**。以中央事件总线（EventBus）为核心架构，所有组件可插拔替换。
 
-The project was developed iteratively across 10 versions (v1–v10), each addressing critical flaws discovered in the previous version — from data leakage bugs to unrealistic execution assumptions to cross-validation methodology. The final v10 uses Combinatorial Purged Cross-Validation (CPCV) across 15 splits on 1M+ bars of real Binance market data, with adversarial execution modeling, achieving **Sharpe 0.38 and +58% return** on purely out-of-sample data.
+The project was developed iteratively across 13 versions (v1–v13), each addressing critical flaws discovered in the previous version — from data leakage bugs to unrealistic execution assumptions to cross-validation methodology, including two self-discovered result-invalidating bugs documented below (paper trading on random weights; a ms→µs timestamp switch that silently corrupted bar aggregation). The current v13 trains on true 1h bars with a 24h horizon-aligned label, validates via 15-split CPCV (all 15 folds positive, OOS rank IC 0.064), and monetizes the weak signal with a banded top-K portfolio (Novy-Marx–Velikov buy/hold bands): **+32.6% / Sharpe 0.81** under the TWAP adverse-selection cost model, **+18.2% / Sharpe 0.53 conservative lower bound** under a flat 8bps/side cost cross-checked by an independent second engine. Deflated Sharpe Ratio (0.11) is disclosed: the edge is not yet statistically separable from multiple-testing luck — live paper trading is the arbiter.
 
-项目经历了 10 个大版本的迭代（v1–v10），每个版本都在解决上一版暴露出的致命缺陷——从数据泄露、不切实际的撮合假设到交叉验证方法论漏洞。最终 v10 在 100 万+ 条真实 Binance 市场数据上使用组合净化交叉验证（CPCV, 15 splits），含逆向选择撮合模拟，在纯样本外数据上达到 **Sharpe 0.38、收益率 +58%**。
+项目经历了 13 个大版本的迭代（v1–v13），每个版本都在解决上一版暴露出的致命缺陷——从数据泄露、不切实际的撮合假设到交叉验证方法论漏洞，包括两个自查发现、推翻全部已发布结果的 bug（模拟盘跑随机权重；Binance 时间戳 ms→µs 切换导致聚合静默损坏）。当前 v13 在真实 1h bar 上以 24h 持有期对齐标签训练，15 折 CPCV 全部为正（OOS rank IC 0.064），用双阈值 banded top-K 组合（Novy-Marx–Velikov buy/hold bands）将弱信号变现：TWAP 逆向选择成本模型下 **+32.6% / Sharpe 0.81**，独立第二引擎交叉验证的固定 8bps/边保守下界 **+18.2% / Sharpe 0.53**。同时如实披露 DSR=0.11：该收益尚不能与多重测试运气区分——模拟盘是最终裁判。
 
 ---
 
@@ -146,6 +146,17 @@ The project was developed iteratively across 10 versions (v1–v10), each addres
 | `engine/adaptive_sizing.py` | RL-inspired Kelly with drawdown awareness / 自适应Kelly仓位 |
 | `model/patch_tst.py` | **PatchTST** alternative (ICLR 2023) cross-asset variant / PatchTST模型 |
 
+### v13 New Modules | v13 新增模块
+
+| Module 模块 | Description 描述 |
+|--------|-------------|
+| `run_v13_final.py` | 24h label + banded top-K backtest comparison + production ckpt / 24h标签+banding对照回测 |
+| `tools/validation_stats.py` | **PSR + Deflated Sharpe Ratio** (Bailey & López de Prado) / 概率夏普+紧缩夏普 |
+| `tools/paper_live_ic.py` | Live cross-sectional rank IC from paper-trading logs / 模拟盘实时rank IC |
+| `tools/crosscheck_v13_engines.py` | Independent second backtest engine for cost cross-validation / 独立第二引擎交叉验证 |
+| `REVIEW_2026-06-10.md` | Full code review + literature survey + v13 implementation log / 全项目审查+文献调研+实施记录 |
+| `ENGINE_CROSSCHECK_2026-06-10.md` | Engine divergence + cost-model sensitivity report / 引擎分歧与成本敏感性报告 |
+
 ---
 
 ## Version History | 版本迭代史
@@ -165,59 +176,71 @@ The project was developed iteratively across 10 versions (v1–v10), each addres
 | **v11** | **13 factors + d128 + 18-month data + daily paper trading** | More data + alternative factors + production readiness / 更多数据+另类因子+生产就绪 |
 | **v11.1** | **Checkpoint save/load + paper trading bug fix** | Discovered paper trading was running on RANDOM weights for 12 days (41.7% win rate ≈ random) / 发现 paper trading 跑了12天随机权重模型 |
 | **v11.2** | **10-feature optimization sweep** | Major upgrade: 21 factors, fold ensemble, Numba backtest, PatchTST, multi-TF, real funding rate, on-chain data, WS feed, adaptive Kelly, factor IC analyzer / 21因子+折集成+Numba回测+PatchTST等 |
+| **v12** | **Cost-aware training: turnover penalty in loss + vol filter + min_hold 96** | v11.1 paid $632K in fees — train the model itself to output temporally smooth scores / v11.1 手续费 63 万：让模型原生输出低换手信号 |
+| **v13** | **Timestamp bug fix (ALL v11/v12 results invalidated and rerun) + 24h label + banded top-K portfolio + PSR/DSR + gap-healing paper trading** | Binance Vision switched kline timestamps to microseconds in 2025-01 — 97% of "1h bars" were raw 5m bars; horizon mismatch (1h label vs multi-day hold) + per-bar full rebalance were killing net PnL / Binance 时间戳切微秒导致 97% 假聚合；标签与持有期错配 + 全量换仓吃掉净收益 |
 
 ---
 
 ## Results | 回测结果
 
-### v11 (Latest) — 15-split CPCV, 117K OOS bars, 18 months | 最新：15折CPCV，117K样本，18个月
+### v13 (Current) — fixed true-1h data, 24h label, banded top-K portfolio | 当前版本
 
 ```
-Source / 数据源:       Binance 5m klines (18 months, 3.15M rows) → aggregated to 1h
-                       Binance 5分钟K线（18个月，315万行）→ 聚合为1小时
-Assets / 资产:         20 crypto pairs / 20个加密货币交易对
-Factors / 因子:        13 plugin factors (10 price-volume + 3 alternative)
-                       13个插件因子（10个量价 + 3个另类）
-Model / 模型:          CrossAssetGRUAttention d_model=128, 617K params
-Validation / 验证:     CPCV (N=6, k=2) → 15 splits, purge=24, embargo=48
-OOS Coverage / OOS覆盖: 117,672 bars (100% of samples) / 全部样本
-Execution / 执行:       TWAP 4-slice + adverse selection (65% adverse fill)
+Source / 数据源:       Binance 5m klines (19 months) → TRUE 1h bars after the
+                       ms/µs timestamp fix / 时间戳修复后的真实1h bar
+Assets / 资产:         20 crypto pairs, timestamp-intersection aligned / 20个交易对，时间戳对齐
+Bars / 样本:           13,153 hourly bars → 13,105 samples
+Factors / 因子:        19 (re-ranked by IC on TRUE 1h data; dropped macd + volume_zscore)
+Model / 模型:          CrossAssetGRUAttention d_model=128 + turnover-penalty loss
+Label / 标签:          24h forward return — matched to the daily decision cadence
+Validation / 验证:     CPCV (N=6, k=2) → 15 splits, purge=48, embargo=48,
+                       purged train/val gap inside folds
+Execution / 执行:       TWAP 4-slice + adverse selection, per-leg cost on each
+                       asset's own path, positions effective NEXT bar (no
+                       decision-bar lookahead PnL)
 
-Avg Rank Corr / 平均排名相关: 0.062 (all 15 folds positive / 15折全部为正)
-Total Return / 总收益:       -56.1% (dominated by transaction costs / 交易成本主导)
-Max Drawdown / 最大回撤:     60.6%
-Rebalances / 换仓次数:       2,451
-Transaction Cost / 交易成本:  $369K (36.9% of capital / 占本金36.9%)
-Avg Hold / 平均持仓:         48 hours / 48小时
+CPCV val rank corr / 折内验证:  0.0874 avg (range 0.044–0.138, 15/15 positive)
+OOS ensemble rank IC / 样本外:  0.064 (24h label)
+
+Portfolio construction comparison (same OOS predictions, same cost model):
+组合构建对照（同一OOS预测、同一成本模型）:
+  top1/bottom1, hourly, min_hold 96   ->  -44.5%  (Sharpe -0.76)
+  top1/bottom1, daily full rebalance  ->  -10.7%  (Sharpe  0.02)
+  banded top3/bottom3 (enter<3/exit>=6) -> +32.6%  (Sharpe  0.81, maxDD 23.4%)
+
+Cost-model sensitivity (independent second-engine cross-check):
+成本口径敏感性（独立第二引擎交叉验证，见 ENGINE_CROSSCHECK_2026-06-10.md）:
+  TWAP adverse-selection model (~5bps/side realized) -> +32.6% / Sharpe 0.81
+  Flat 8bps/side, conservative lower bound           -> +18.2% / Sharpe 0.53
+  Engine-mechanics divergence at identical costs:    -0.8 ~ +1.3pp
+
+Honest statistics / 诚实统计:
+  PSR (vs SR*=0)                  0.84
+  Deflated Sharpe Ratio (N=50)    0.11  <- NOT yet separable from
+                                          multiple-testing luck; paper
+                                          trading is the arbiter
 ```
-
-### Version Comparison | 版本对比
-
-| Metric 指标 | v8 (WFO) | v10 (CPCV 6m) | v11 (CPCV 18m) |
-|------|:---:|:---:|:---:|
-| Data / 数据 | 44K bars (6m) | 44K bars (6m) | **117K bars (18m)** |
-| Factors / 因子 | 10 | 10 | **13** |
-| Model params / 模型参数 | 124K | 124K | **617K (d128)** |
-| Rank Correlation | 0.025 | 0.068 | **0.062** |
-| OOS Coverage | 43,200 | 44,760 | **117,672** |
-| Statistical confidence / 统计置信度 | Low / 低 | Medium / 中 | **High / 高** |
-| Bug: Lookahead | Yes | Fixed | Fixed |
-| Bug: Boundary leak | Yes | Fixed | Fixed |
 
 ### Key Findings | 核心发现
 
-- **CPCV >> WFO**: 15-split CPCV with purge+embargo produces 2.7x better rank correlation than sequential WFO, because each fold trains on ~24K samples (vs 1.4K in WFO)
-  CPCV 远优于 WFO：每个 fold 训练 24K 样本（WFO 仅 1.4K），排名相关性提升 2.7 倍
-- **Rank correlation is stable at 0.06**: Consistent across 6-month and 18-month datasets, across d_model=64 and d_model=128, proving the signal is real and not an artifact of any specific configuration
-  排名相关性稳定在 0.06：跨 6 个月和 18 个月数据集、跨 d_model=64 和 128 均一致，证明信号真实
-- **1h label >> 6h label**: 6h cumulative return as training target degrades rank_corr from 0.068 to 0.039 — crypto 1h reversal signal is stronger at shorter horizons
-  1h 标签远优于 6h 标签：6h 标签将 rank_corr 从 0.068 降至 0.039，crypto 短期反转信号在更短周期更强
-- **Transaction costs dominate PnL**: With 65% adverse fill rate and 2,451 rebalances, costs ($369K) exceed gross alpha — paper trading is the next validation step
-  交易成本主导 PnL：65% 逆向成交率 + 2451 次换仓，成本远超毛利 — 模拟盘是下一步验证
-- **Model > pure factors**: v9 diagnosis proved GRU+Attention (rank_corr=0.025) beats pure factor reversal (-37%) and pure momentum (-25%)
-  模型优于纯因子：v9 诊断证明 GRU+Attention 优于纯因子反转和纯动量策略
+- **The signal is real but weak, and the money is in not trading**: identical predictions span -44.5% to +32.6% depending purely on portfolio construction. Buy/hold banding (Novy-Marx & Velikov, RFS 2016) cuts effective turnover while keeping signal exposure
+  信号真实但弱，钱省在"不交易"上：同一预测矩阵仅因组合构建不同就横跨 -44.5% 到 +32.6%。双阈值 banding 在保留信号暴露的同时大幅降低有效换手
+- **Label horizon must match the holding period**: v11/v12 trained on 1-bar labels but held for days — the predicted bar was never tradable. v13's 24h label aligns training, backtest, and paper trading into the SAME strategy
+  标签必须对齐持有期：v11/v12 用 1-bar 标签却持仓数日，被预测的那根 bar 根本不可交易；v13 的 24h 标签让训练、回测、模拟盘成为同一个策略
+- **Always re-derive factor rankings after a data fix**: on true 1h bars the IC ranking inverted — vol factors (std20, klen) lead at the 24h horizon, and a previously-dropped factor (klow) was #5. The old drop list was an artifact of corrupted aggregation
+  数据修复后必须重排因子：真 1h 数据上 IC 排名彻底洗牌，波动率类因子领跑 24h 周期，旧剔除名单是污染数据的伪影
+- **Report DSR next to Sharpe**: a +32.6% backtest with DSR 0.11 is a hypothesis, not an edge. CPCV alone cannot control researcher degrees of freedom across 13 versions of iteration
+  Sharpe 旁边必须放 DSR：DSR 0.11 的 +32.6% 是一个待验证假设而非已证实的 edge；CPCV 无法控制 13 个版本迭代积累的研究者自由度
 
-### v11.1 Bug Fix: Paper Trading Was Running Random Weights | v11.1 修复：模拟盘跑的是随机权重
+### Two Self-Discovered Result-Invalidating Bugs | 两个自查发现的"推翻结果"级 bug
+
+**Case 2 — v13: 97% of "1h bars" were raw 5m bars | 时间戳静默损坏**
+
+Binance Vision switched kline CSV timestamps from milliseconds to **microseconds** in 2025-01 archives. The 1h aggregation (`open_time // 3_600_000`) silently bucketed µs rows into 3.6-second bins — every 5m bar became its own "1h bar". 97% of v11/v12's "117K hourly bars" were raw 5m bars: labels were 5m returns, "48h holds" were ~4h, and the funding factor was both look-ahead and constant-zero after normalization. Fixed by unit normalization in the lake loader; every v11/v12 headline number was discarded and rerun as v13.
+
+Binance Vision 自 2025-01 起将 K 线时间戳改为**微秒**，按毫秒分桶的 1h 聚合把每根 5m bar 静默地变成独立"1h bar"——v11/v12 的"117K 小时样本"中 97% 是原始 5m bar：标签实为 5m 收益、"48h 持仓"实为 4 小时、funding 因子既前视又恒为零。在数据湖加载层做单位归一化修复后，v11/v12 全部结果作废并以 v13 重跑。
+
+**Case 1 — v11.1: Paper Trading Was Running Random Weights | 模拟盘跑的是随机权重**
 
 After 12 days of paper trading (Mar 30 – Apr 24), reviewing accumulated data revealed:
 - Win rate: **41.7%** (5W / 7L) — close to random baseline
@@ -266,20 +289,30 @@ python data/archive_downloader.py
 python data/async_feed.py
 ```
 
-### 2. Run v11 CPCV Pipeline (Recommended) | 运行 v11 CPCV 管线（推荐）
+### 2. Run v13 Pipeline (Recommended) | 运行 v13 管线（推荐）
 
 ```bash
-# v11: 13 factors + d128 + 18-month data + CPCV (~40 min on RTX 5090)
-# v11：13因子 + d128 + 18个月数据 + CPCV（RTX 5090约40分钟）
-python run_v11_final.py
+# v13: 19 factors + 24h label + CPCV + banded-portfolio backtest comparison
+#      + PSR/DSR (~8 min on RTX 5090)
+# v13：19因子 + 24h标签 + CPCV + banding组合对照回测 + PSR/DSR（5090约8分钟）
+python run_v13_final.py
 ```
 
 ### 3. Daily Paper Trading | 每日模拟盘
 
 ```bash
-# Run once per day (~30 seconds): fetch bars → inference → log signal → reconcile
-# 每天跑一次（约30秒）：拉K线 → 推理 → 记录信号 → 对账
-python run_paper_daily.py
+# Run once per day (~1 min): fetch CLOSED bars (multi-exchange, all-20-or-die)
+# -> real funding -> inference -> banded basket update -> reconcile -> SQLite.
+# Self-heals gaps: missed days are backfilled at the daily mark (signals
+# recomputed causally; basket positions stay frozen). Same-day reruns upsert.
+# 每日一次（约1分钟）：已收盘K线（跨所补抓，20币强制全齐）→ 真实funding →
+# 推理 → banding篮子更新 → 对账入库。断档自愈：缺失日自动补课（信号因果
+# 回算；篮子持仓冻结）。同日重跑 upsert 不重复记账。
+python run_paper_daily.py            # auto-selects v13 checkpoint / 自动选v13
+python run_paper_daily.py --dry-run  # test without writing / 测试不写库
+
+# Live signal quality once data accumulates / 数据积累后查看 live rank IC:
+python tools/paper_live_ic.py
 ```
 
 ### 4. Legacy Pipelines | 旧版管线
@@ -343,10 +376,18 @@ quant-infra/
 │   ├── ws_daemon.py               # WebSocket daemon
 │   ├── lake_loader.py             # Parquet loader / 数据湖加载
 │   └── synthetic_lob.py           # Synthetic data / 合成数据
-├── run_v11_final.py               # v11 CPCV (13 factors, d128, 18m) / v11主管线
+├── tools/                         # Analysis & validation / 分析与验证
+│   ├── factor_analyzer.py         # Alphalens-style IC (true 1h) / 因子IC分析
+│   ├── validation_stats.py        # PSR + Deflated Sharpe / 统计验证
+│   ├── paper_live_ic.py           # Live rank IC from paper logs / 实时IC
+│   ├── crosscheck_v13_engines.py  # Second-engine cost cross-check / 引擎交叉验证
+│   └── recompute_backtest.py      # Recompute from fold ckpts / 复算工具
+├── run_v13_final.py               # v13: 24h label + banded portfolio / v13主管线
+├── run_v12_final.py               # v12 cost-aware training / v12管线
+├── run_v11_final.py               # v11 CPCV (13 factors, d128, 18m) / v11管线
 ├── run_v10_cpcv.py                # v10 CPCV pipeline / v10管线
 ├── run_paper.py                   # Paper trading entry / 模拟盘入口
-├── run_paper_daily.py             # Daily batch paper trading / 每日批处理模拟盘
+├── run_paper_daily.py             # Daily paper trading + gap backfill / 每日模拟盘（断档自愈）
 ├── run_v8_bigdata.py              # v8 WFO (bug-fixed) / v8 WFO（已修复）
 ├── run_v6_lowfreq.py              # v6 low-freq / v6低频
 ├── run_v7_wfo.py                  # v7 WFO
@@ -368,13 +409,26 @@ Developed and tested on / 开发和测试环境：
 
 ## References | 参考论文
 
+Portfolio construction & transaction costs / 组合构建与交易成本:
+- *Dynamic Trading with Predictable Returns and Transaction Costs* — Gârleanu & Pedersen, JF 2013 (aim in front of the target, partial rebalancing)
+- *A Taxonomy of Anomalies and Their Trading Costs* — Novy-Marx & Velikov, RFS 2016 (buy/hold banding — basis of v13 portfolio construction)
+- *Multi-Period Trading via Convex Optimization* — Boyd et al. (arXiv 1705.00109)
+- *Finance-Grounded Optimization For Algorithmic Trading* (arXiv 2509.04541, band turnover regularization)
+
+Validation / 统计验证:
+- *Advances in Financial Machine Learning* — Marcos López de Prado (CPCV methodology)
+- *The Deflated Sharpe Ratio* — Bailey & López de Prado, JPM 2014 (v13 reports DSR)
+- *Implementation Risk in Portfolio Backtesting* (arXiv 2603.20319 — motivated the v13 second-engine cross-check)
+
+Models & signals / 模型与信号:
+- *Building Cross-Sectional Systematic Strategies By Learning to Rank* — Poh, Lim, Zohren, Roberts (arXiv 2012.07149, ListMLE for cross-sections)
 - *Sentiment-Aware Stock Price Prediction with Transformer and LLM-Generated Formulaic Alpha* (arXiv 2508.04975)
 - *From Attention to Profit: Quantitative Trading Strategy Based on Transformer* (arXiv 2404.00424)
 - *Machine Learning Enhanced Multi-Factor Quantitative Trading* (arXiv 2507.07107)
 - *A Controlled Comparison of Deep Learning for Multi-Horizon Financial Forecasting* (arXiv 2603.16886)
 - *Exploring Microstructural Dynamics in Cryptocurrency LOBs* (arXiv 2506.05764)
 - *TLOB: Transformer with Dual Attention for LOB Price Prediction* (arXiv 2502.15757)
-- *Advances in Financial Machine Learning* — Marcos Lopez de Prado (CPCV methodology)
+- *Crypto Carry* — Schmeling, Schrimpf & Todorov, BIS WP 1087
 
 ---
 

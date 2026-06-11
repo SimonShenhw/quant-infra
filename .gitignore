@@ -31,3 +31,7 @@ Thumbs.db
 .env
 .venv/
 venv/
+
+# Machine-local (hardcoded paths / scheduler output)
+run_paper_daily_scheduled.bat
+paper_daily_log.txt

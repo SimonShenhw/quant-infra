@@ -114,7 +114,20 @@ def load_klines(
     if not normalized:
         return pl.DataFrame()
     combined: pl.DataFrame = pl.concat(normalized)
-    combined = combined.sort("open_time").unique(subset=["open_time"])
+    # Binance Vision switched kline timestamps from milliseconds to
+    # microseconds in 2025-01 archives; normalize everything to ms so
+    # downstream time-bucket aggregation ( // 3_600_000 ) stays correct.
+    # Binance Vision 自 2025-01 起 K 线时间戳从毫秒改为微秒；统一归一化为
+    # 毫秒，保证下游按毫秒分桶的 1h 聚合正确。
+    combined = combined.with_columns(
+        pl.when(pl.col("open_time") > 100_000_000_000_000)
+        .then(pl.col("open_time") // 1000)
+        .otherwise(pl.col("open_time"))
+        .alias("open_time")
+    )
+    # unique() does not guarantee order — dedupe first, then sort.
+    # unique() 不保证顺序——先去重再排序。
+    combined = combined.unique(subset=["open_time"], keep="first").sort("open_time")
     return combined
 
 

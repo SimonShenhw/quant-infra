@@ -1,43 +1,46 @@
 """
-run_paper_daily.py — Daily batch paper trading.
-每日批处理模拟盘。
+run_paper_daily.py — Daily batch paper trading with gap catch-up.
+每日批处理模拟盘（带缺失日补课）。
 
-Run once per day (~30 seconds):
-  1. Fetch latest 48h of 1h bars for 20 assets via CCXT
-  2. Build factor tensor using checkpoint's saved factor_names (post-drop)
-  3. Model inference + emit today's long/short pick
-  4. Reconcile yesterday's signal vs realized returns
-  5. Log everything to SQLite
+Flow per run (~1 minute):
+  1. Read DB to find the last recorded day; fetch enough CLOSED 1h bars to
+     cover the gap (250 + 24/missed-day, multi-exchange okx -> bybit -> gate,
+     HARD FAIL if any of the 20 assets is missing).
+  2. Fetch real funding-rate history and align to bars (v13 checkpoints).
+  3. BACKFILL each missed day at the 11:00 UTC (19:00 Beijing) mark:
+       - signal scores recomputed from bars available at that mark (causal,
+         deterministic — what the model WOULD have said; feeds live rank IC)
+       - basket positions stay FROZEN (nobody traded on missed days); only
+         daily PnL marks are recorded (slot_changes=0, cost=0)
+  4. Reconcile + run TODAY's inference, banded basket update, log everything.
+     Same-day reruns upsert instead of duplicating.
 
-Compatibility:
-  - v12 (default): loads checkpoints/v12_production.pt; 17 factors
-  - v11.1: pass --ckpt v11 to load checkpoints/v11_production.pt
-
-Known caveats (TODO):
-  - funding_rate factor falls back to OHLCV proxy here (no extras passed),
-    while v11.1+/v12 trained on REAL Binance Vision funding. Slight domain
-    shift. To fix: fetch live funding via CCXT and pass extras={"funding":...}
+v13 upgrades vs the old script: see REVIEW_2026-06-10.md appendix
+(H-2/H-3/H-4/H-5/M-4/L-2/L-3 fixes + banded top-K basket).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch import Tensor
 
-sys.path.insert(0, ".")
+BASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE_DIR))
 
 import factors as _  # trigger auto-discover / 触发自动发现
 from factors.base import FactorRegistry
 from model.cross_asset_attention import CrossAssetGRUAttention
 
-DB_PATH: str = str(Path(__file__).resolve().parent / "paper_daily.db")
+DB_PATH: str = str(BASE_DIR / "paper_daily.db")
 
 SYMBOLS: List[str] = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
@@ -46,9 +49,35 @@ SYMBOLS: List[str] = [
     "ARB/USDT", "OP/USDT", "SUI/USDT", "INJ/USDT", "AAVE/USDT",
 ]
 
+N_BARS_BASE: int = 250       # warmup: 48-bar z-score + EMAs converge well before seq tail / 暖机
+N_BARS_MAX: int = 950        # exchange fetch cap / 交易所单次拉取上限内
+MARK_HOUR_UTC: int = 23      # daily mark = close of the 22:00-23:00 UTC bar (~19:00 US Eastern,
+                             # matches the 19:30 local scheduled run) / 每日记账时点，对齐本地19:30运行
+MAX_BACKFILL_DAYS: int = 28  # beyond this, declare a break instead of backfilling / 超过则视为断档
+EST_COST_BPS: float = 8.0    # per traded slot notional (fee+slippage est.) / 每槽位成本估计
 
-def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+# Match run_v12_final.py's training drops; v13 ckpts carry factor_names.
+DROP_FACTORS_FALLBACK = {"volume_zscore", "volume_momentum", "macd", "klow"}
+
+
+def utc_today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def date_range_exclusive(d0: str, d1: str) -> List[str]:
+    """Dates strictly between d0 and d1. / d0 与 d1 之间（不含端点）的日期。"""
+    a = datetime.strptime(d0, "%Y-%m-%d")
+    b = datetime.strptime(d1, "%Y-%m-%d")
+    out = []
+    cur = a + timedelta(days=1)
+    while cur < b:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return out
+
+
+def init_db(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS daily_signals (
             date TEXT, long_asset TEXT, short_asset TEXT,
@@ -61,230 +90,594 @@ def init_db() -> sqlite3.Connection:
             long_ret REAL, short_ret REAL, port_ret REAL,
             cumulative_ret REAL
         );
+        CREATE TABLE IF NOT EXISTS basket_state (
+            date TEXT PRIMARY KEY,
+            long_assets TEXT, short_assets TEXT,
+            all_scores TEXT, all_closes TEXT,
+            ckpt TEXT
+        );
+        CREATE TABLE IF NOT EXISTS basket_pnl (
+            date TEXT PRIMARY KEY,
+            prev_date TEXT, n_days INTEGER,
+            prev_long TEXT, prev_short TEXT,
+            long_ret REAL, short_ret REAL, port_ret REAL,
+            slot_changes INTEGER, cost_est REAL,
+            cumulative_ret REAL
+        );
     """)
+    try:
+        conn.execute("ALTER TABLE daily_signals ADD COLUMN all_closes TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists / 列已存在
     conn.commit()
     return conn
 
 
-def fetch_bars(symbols: List[str], n_bars: int = 50) -> Dict[str, List[Tuple]]:
-    """Fetch latest N 1h bars per symbol via CCXT. / 通过CCXT获取每个标的最近N根1h K线。"""
+def last_recorded_date(conn: sqlite3.Connection) -> Optional[str]:
+    row = conn.execute("SELECT MAX(date) FROM daily_signals").fetchone()
+    return row[0] if row and row[0] else None
+
+
+# ============================================================================
+# Data fetch
+# ============================================================================
+
+def _drop_unclosed(ohlcv: List[List[float]]) -> List[List[float]]:
+    """Keep only bars whose 1h window has fully elapsed (H-5).
+    仅保留已完整收盘的 1h K线。"""
+    now_ms = int(time.time() * 1000)
+    return [k for k in ohlcv if k[0] + 3_600_000 <= now_ms]
+
+
+def fetch_bars(symbols: List[str], n_bars: int) -> Dict[str, List[Tuple]]:
+    """
+    Latest N CLOSED 1h bars per symbol; okx -> bybit -> gate fill; raises if
+    ANY symbol missing (positional asset embedding, H-3).
+    Returns {clean_symbol: [(ts_ms, o, h, l, c, v), ...]}.
+    """
     import ccxt
-    exchanges = ["okx", "bybit", "gate"]
-    ex = None
-    for name in exchanges:
+    result: Dict[str, List[Tuple]] = {}
+    for name in ["okx", "bybit", "gate"]:
+        missing = [s for s in symbols if s.replace("/", "") not in result]
+        if not missing:
+            break
         try:
             ex = getattr(ccxt, name)({"enableRateLimit": True, "timeout": 30000})
             ex.load_markets()
-            break
-        except Exception:
+        except Exception as e:
+            print(f"  [{name}] unavailable: {e}")
             continue
-    if ex is None:
-        raise RuntimeError("All exchanges failed")
+        got = 0
+        for sym in missing:
+            if sym not in ex.markets:
+                continue
+            try:
+                ohlcv = ex.fetch_ohlcv(sym, "1h", limit=n_bars)
+                ohlcv = _drop_unclosed(ohlcv or [])
+                if len(ohlcv) >= 100:
+                    clean = sym.replace("/", "")
+                    result[clean] = [(k[0], k[1], k[2], k[3], k[4], k[5]) for k in ohlcv]
+                    got += 1
+                time.sleep(0.25)
+            except Exception:
+                continue
+        print(f"  [{name}] filled {got} symbols")
 
-    result: Dict[str, List[Tuple]] = {}
-    for sym in symbols:
-        if sym not in ex.markets:
-            continue
-        try:
-            ohlcv = ex.fetch_ohlcv(sym, "1h", limit=n_bars)
-            if ohlcv and len(ohlcv) >= 30:
-                clean = sym.replace("/", "")
-                result[clean] = [(k[1], k[2], k[3], k[4], k[5]) for k in ohlcv]
-            time.sleep(0.3)
-        except Exception:
-            continue
+    missing = [s for s in symbols if s.replace("/", "") not in result]
+    if missing:
+        raise RuntimeError(
+            f"Missing {len(missing)} symbols after all exchanges: {missing}. "
+            f"Refusing to run inference with a shifted asset universe (H-3)."
+        )
     return result
 
 
-# Match the noise factors dropped by v11.1+/v12 training (run_v11_final.py /
-# run_v12_final.py). Used as fallback if the checkpoint doesn't carry a
-# factor_names list. Keep in sync if training drops change.
-# 与 v11.1+/v12 训练脚本剔除的因子保持一致；若 ckpt 自带 factor_names 优先用它。
-DROP_FACTORS_FALLBACK = {"volume_zscore", "volume_momentum", "macd", "klow"}
+def fetch_funding(
+    symbols: List[str], bars: Dict[str, List[Tuple]], device: torch.device,
+) -> Optional[Dict[str, Tensor]]:
+    """Real 8h funding history forward-filled onto bar timestamps (H-4).
+    真实资金费率前向填充到 bar 时间戳。okx -> bybit -> gate。"""
+    import ccxt
+    out: Dict[str, Tensor] = {}
+    for name in ["okx", "bybit", "gate"]:
+        missing = [s for s in symbols if s.replace("/", "") not in out]
+        if not missing:
+            break
+        try:
+            ex = getattr(ccxt, name)({"enableRateLimit": True, "timeout": 30000})
+            ex.load_markets()
+        except Exception as e:
+            print(f"  [funding:{name}] unavailable: {e}")
+            continue
+        got = 0
+        for sym in missing:
+            clean = sym.replace("/", "")
+            bar_ts = np.asarray([b[0] for b in bars[clean]], dtype=np.int64)
+            swap = f"{sym}:USDT"
+            try:
+                hist = ex.fetch_funding_rate_history(swap, limit=100)  # ~33d at 8h
+                if not hist:
+                    continue
+                ts = np.asarray([h["timestamp"] for h in hist], dtype=np.int64)
+                rt = np.asarray([float(h["fundingRate"]) for h in hist], dtype=np.float32)
+                order = np.argsort(ts)
+                ts, rt = ts[order], rt[order]
+                idx = np.searchsorted(ts, bar_ts, side="right") - 1
+                vals = np.zeros(len(bar_ts), dtype=np.float32)
+                ok = idx >= 0
+                vals[ok] = rt[idx[ok]]
+                out[clean] = torch.from_numpy(vals).to(device)
+                got += 1
+                time.sleep(0.15)
+            except Exception:
+                continue
+        print(f"  [funding:{name}] filled {got} symbols")
+
+    still = [s for s in symbols if s.replace("/", "") not in out]
+    if still:
+        print(f"  [funding] WARNING: {len(still)} symbols fell back to zeros: "
+              f"{[s.replace('/', '') for s in still]}")
+        for sym in still:
+            clean = sym.replace("/", "")
+            out[clean] = torch.zeros(len(bars[clean]), dtype=torch.float32, device=device)
+    return out
+
+
+# ============================================================================
+# Model + features (built ONCE on the full window; slices are causal)
+# ============================================================================
+
+def load_checkpoint(ckpt_path: Path, device: torch.device) -> dict:
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {ckpt_path}\n"
+            f"Run `python run_v13_final.py` (or v12) to train first."
+        )
+    try:
+        return torch.load(ckpt_path, map_location=device, weights_only=True)
+    except Exception:
+        return torch.load(ckpt_path, map_location=device, weights_only=False)
 
 
 def _resolve_factor_names(ckpt: dict) -> List[str]:
-    """Pick the factor list that matches the checkpoint's n_factors.
-    选用与 ckpt 的 n_factors 匹配的因子列表。"""
     n_expected = int(ckpt["n_factors"])
     saved = ckpt.get("factor_names")
     if isinstance(saved, list) and len(saved) == n_expected:
         return list(saved)
-    # fallback: drop the noise factors and confirm the count matches
     fallback = [n for n in FactorRegistry.list_factors() if n not in DROP_FACTORS_FALLBACK]
     if len(fallback) == n_expected:
         return fallback
     raise RuntimeError(
         f"Cannot resolve factor list: ckpt expects {n_expected} factors, "
         f"saved factor_names has {len(saved) if saved else 'None'}, "
-        f"fallback (after drops) has {len(fallback)}. "
-        f"Update DROP_FACTORS_FALLBACK in run_paper_daily.py."
+        f"fallback (after drops) has {len(fallback)}."
     )
 
 
-def run_inference(
-    bars: Dict[str, List[Tuple]], device: torch.device,
-    seq_len: int = 24, ckpt_path: str = "checkpoints/v12_production.pt",
-) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """Run model inference on latest bars. Returns (scores, closes). / 对最新K线运行推理。"""
-    syms = sorted(bars.keys())
-    if len(syms) < 5:
-        raise ValueError(f"Only {len(syms)} symbols, need >= 5")
-
-    # Load trained checkpoint FIRST so we know which factors to build
-    # 先加载 ckpt，从中读出真正训练用的因子列表
-    import os
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {ckpt_path}\n"
-            f"Run `python run_v12_final.py` to train, or pass --ckpt v11 to use v11.1.\n"
-            f"未找到 checkpoint。请先运行 run_v12_final.py 训练，或用 --ckpt v11 加载 v11.1。"
-        )
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    factor_names = _resolve_factor_names(ckpt)
-    print(f"  Loaded {ckpt_path} (val_corr={ckpt['val_corr']:.4f}, {len(factor_names)} factors)")
-
-    all_factors = []
-    closes = {}
-    for sym in syms:
-        b = bars[sym]
-        o = torch.tensor([x[0] for x in b], dtype=torch.float32, device=device)
-        h = torch.tensor([x[1] for x in b], dtype=torch.float32, device=device)
-        l = torch.tensor([x[2] for x in b], dtype=torch.float32, device=device)
-        c = torch.tensor([x[3] for x in b], dtype=torch.float32, device=device)
-        v = torch.tensor([x[4] for x in b], dtype=torch.float32, device=device)
-        f = FactorRegistry.build_tensor(factor_names, o, h, l, c, v, zscore_window=48)
-        all_factors.append(f[-seq_len:])
-        closes[sym] = b[-1][3]  # last close
-
-    x = torch.stack(all_factors, dim=0).unsqueeze(0).to(device)  # (1, A, T, F)
-
+def build_model(ckpt: dict, device: torch.device) -> CrossAssetGRUAttention:
     model = CrossAssetGRUAttention(
-        n_factors=ckpt["n_factors"],
-        d_model=ckpt["d_model"],
-        gru_layers=ckpt["gru_layers"],
-        n_cross_heads=ckpt["n_cross_heads"],
-        n_cross_layers=ckpt["n_cross_layers"],
-        d_ff=ckpt["d_ff"],
-        dropout=0.0,  # no dropout at inference / 推理时关闭dropout
-        seq_len=ckpt["seq_len"],
-        max_assets=ckpt["max_assets"],
+        n_factors=ckpt["n_factors"], d_model=ckpt["d_model"],
+        gru_layers=ckpt["gru_layers"], n_cross_heads=ckpt["n_cross_heads"],
+        n_cross_layers=ckpt["n_cross_layers"], d_ff=ckpt["d_ff"],
+        dropout=0.0, seq_len=ckpt["seq_len"], max_assets=ckpt["max_assets"],
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
+    return model
 
+
+def build_features(
+    bars: Dict[str, List[Tuple]], ckpt: dict, device: torch.device,
+    funding: Optional[Dict[str, Tensor]],
+) -> Dict[str, dict]:
+    """
+    Per symbol: bar timestamps, full-window factor tensor, closes.
+    All factor primitives are causal, so slicing rows [:i+1] is identical to
+    recomputing on truncated input — backfilled scores are leak-free.
+    每标的：时间戳、全窗口因子张量、收盘价。所有因子原语严格因果，
+    按行切片等价于在截断输入上重算——补课打分无泄漏。
+    """
+    factor_names = _resolve_factor_names(ckpt)
+    needs_funding = bool(ckpt.get("needs_real_funding", False))
+    if needs_funding and funding is None:
+        print("  WARNING: ckpt was trained on real funding but live funding "
+              "unavailable — funding factor degrades to zeros this run.")
+    feats: Dict[str, dict] = {}
+    for sym in sorted(bars.keys()):
+        b = bars[sym]
+        o = torch.tensor([x[1] for x in b], dtype=torch.float32, device=device)
+        h = torch.tensor([x[2] for x in b], dtype=torch.float32, device=device)
+        l = torch.tensor([x[3] for x in b], dtype=torch.float32, device=device)
+        c = torch.tensor([x[4] for x in b], dtype=torch.float32, device=device)
+        v = torch.tensor([x[5] for x in b], dtype=torch.float32, device=device)
+        extras = None
+        if needs_funding:
+            f_t = (funding or {}).get(sym)
+            if f_t is None or f_t.numel() != c.numel():
+                f_t = torch.zeros_like(c)
+            extras = {"funding": f_t}
+        f = FactorRegistry.build_tensor(factor_names, o, h, l, c, v,
+                                        zscore_window=48, extras=extras)
+        feats[sym] = {
+            "ts": np.asarray([x[0] for x in b], dtype=np.int64),
+            "factors": f,
+            "closes": np.asarray([x[4] for x in b], dtype=np.float64),
+        }
+    return feats
+
+
+def score_at_indices(
+    feats: Dict[str, dict], model, seq_len: int, idx_map: Dict[str, int],
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Inference using each symbol's bars up to (and incl.) idx_map[sym].
+    用每标的截至 idx_map[sym] 的数据推理。Returns (scores, closes)."""
+    syms = sorted(feats.keys())
+    xs, closes = [], {}
+    for sym in syms:
+        i = idx_map[sym]
+        f = feats[sym]["factors"][: i + 1]
+        if f.size(0) < seq_len:
+            raise ValueError(f"{sym}: only {f.size(0)} bars before mark, need {seq_len}")
+        xs.append(f[-seq_len:])
+        closes[sym] = float(feats[sym]["closes"][i])
+    x = torch.stack(xs, dim=0).unsqueeze(0)
     with torch.no_grad():
         scores = model(x).squeeze(0)
-
-    score_dict = {syms[i]: scores[i].item() for i in range(len(syms))}
-    return score_dict, closes
+    return {syms[i]: scores[i].item() for i in range(len(syms))}, closes
 
 
-def reconcile(conn: sqlite3.Connection, bars: Dict[str, List[Tuple]]) -> Optional[Dict]:
-    """Compare yesterday's signal vs actual returns. / 对比昨日信号与实际收益。"""
-    cur = conn.execute(
+def mark_indices_for_date(
+    feats: Dict[str, dict], date: str,
+) -> Optional[Dict[str, int]]:
+    """
+    Index of the daily-mark bar (open at MARK_HOUR-1 UTC, closes MARK_HOUR)
+    per symbol. None if any symbol lacks a bar within 3h before the mark or
+    has too little history before it.
+    每标的找到记账时点对应的bar索引；任一标的缺数据则返回 None。
+    """
+    mark_open_ms = int(datetime.strptime(date, "%Y-%m-%d")
+                       .replace(tzinfo=timezone.utc, hour=MARK_HOUR_UTC - 1)
+                       .timestamp() * 1000)
+    out: Dict[str, int] = {}
+    for sym, d in feats.items():
+        i = int(np.searchsorted(d["ts"], mark_open_ms, side="right")) - 1
+        if i < 72:  # minimal factor warmup before a backfill mark / 最低暖机
+            return None
+        if mark_open_ms - d["ts"][i] > 3 * 3_600_000:
+            return None
+        out[sym] = i
+    return out
+
+
+# ============================================================================
+# Banded basket update (mirrors run_v13_final._banded_targets)
+# ============================================================================
+
+def banded_update(
+    score_dict: Dict[str, float],
+    prev_long: List[str], prev_short: List[str],
+    k: int, enter_band: int, exit_band: int,
+) -> Tuple[List[str], List[str]]:
+    syms = sorted(score_dict.keys())
+    scores = np.asarray([score_dict[s] for s in syms])
+    A = len(syms)
+    order = np.argsort(-scores)
+    rank_of = {syms[a]: int(np.where(order == a)[0][0]) for a in range(A)}
+
+    kept_l = [s for s in prev_long if s in rank_of and rank_of[s] < exit_band]
+    kept_s = [s for s in prev_short if s in rank_of and rank_of[s] >= A - exit_band]
+
+    new_l = list(kept_l)
+    for a in order[:enter_band]:
+        s = syms[a]
+        if len(new_l) >= k:
+            break
+        if s not in new_l and s not in kept_s:
+            new_l.append(s)
+
+    new_s = list(kept_s)
+    for a in order[::-1][:enter_band]:
+        s = syms[a]
+        if len(new_s) >= k:
+            break
+        if s not in new_s and s not in new_l:
+            new_s.append(s)
+
+    return sorted(new_l), sorted(new_s)
+
+
+# ============================================================================
+# Reconcile + logging (date-keyed upserts)
+# ============================================================================
+
+def reconcile_legacy(conn, closes: Dict[str, float], date: str) -> Optional[Dict]:
+    row = conn.execute(
         "SELECT date, long_asset, short_asset, long_close, short_close "
-        "FROM daily_signals ORDER BY date DESC LIMIT 1"
-    )
-    row = cur.fetchone()
+        "FROM daily_signals WHERE date < ? ORDER BY date DESC LIMIT 1", (date,)
+    ).fetchone()
     if row is None:
         return None
-
     prev_date, prev_long, prev_short, prev_lc, prev_sc = row
-
-    # get today's close for those assets / 获取今日收盘价
-    today_lc = bars.get(prev_long, [None])[-1][3] if prev_long in bars and bars[prev_long] else prev_lc
-    today_sc = bars.get(prev_short, [None])[-1][3] if prev_short in bars and bars[prev_short] else prev_sc
-
-    long_ret = (today_lc / prev_lc - 1.0) if prev_lc > 0 else 0.0
-    short_ret = -(today_sc / prev_sc - 1.0) if prev_sc > 0 else 0.0
+    today_lc = closes.get(prev_long, prev_lc)
+    today_sc = closes.get(prev_short, prev_sc)
+    long_ret = (today_lc / prev_lc - 1.0) if prev_lc and prev_lc > 0 else 0.0
+    short_ret = -(today_sc / prev_sc - 1.0) if prev_sc and prev_sc > 0 else 0.0
     port_ret = 0.5 * long_ret + 0.5 * short_ret
 
-    # cumulative / 累计收益
     cum_cur = conn.execute(
-        "SELECT cumulative_ret FROM daily_pnl ORDER BY date DESC LIMIT 1"
+        "SELECT cumulative_ret FROM daily_pnl WHERE date < ? "
+        "ORDER BY date DESC LIMIT 1", (date,)
     ).fetchone()
     prev_cum = cum_cur[0] if cum_cur else 0.0
     cum_ret = (1 + prev_cum) * (1 + port_ret) - 1.0
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    conn.execute("DELETE FROM daily_pnl WHERE date = ?", (date,))
     conn.execute(
         "INSERT INTO daily_pnl VALUES (?,?,?,?,?,?,?)",
-        (today, prev_long, prev_short, long_ret, short_ret, port_ret, cum_ret),
+        (date, prev_long, prev_short, long_ret, short_ret, port_ret, cum_ret),
     )
-    conn.commit()
+    return {"prev_date": prev_date, "long": prev_long, "short": prev_short,
+            "long_ret": long_ret, "short_ret": short_ret,
+            "port_ret": port_ret, "cumulative_ret": cum_ret}
 
-    return {
-        "prev_date": prev_date, "long": prev_long, "short": prev_short,
-        "long_ret": long_ret, "short_ret": short_ret,
-        "port_ret": port_ret, "cumulative_ret": cum_ret,
-    }
 
+def write_signal_row(conn, date: str, score_dict: Dict[str, float],
+                     closes: Dict[str, float]) -> None:
+    ranked = sorted(score_dict.items(), key=lambda x: x[1], reverse=True)
+    long1, short1 = ranked[0][0], ranked[-1][0]
+    conn.execute("DELETE FROM daily_signals WHERE date = ?", (date,))
+    conn.execute(
+        "INSERT INTO daily_signals "
+        "(date, long_asset, short_asset, long_score, short_score, "
+        " long_close, short_close, all_scores, all_closes) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (date, long1, short1, score_dict[long1], score_dict[short1],
+         closes[long1], closes[short1],
+         json.dumps(score_dict), json.dumps(closes)))
+
+
+def basket_step(
+    conn, date: str, score_dict: Dict[str, float], closes: Dict[str, float],
+    ckpt: dict, ckpt_name: str, frozen: bool,
+) -> Optional[Dict]:
+    """
+    One basket day: reconcile vs previous basket_state, then either freeze
+    positions (backfill) or apply the banded update, and write both rows.
+    篮子单日推进：先对账，再冻结（补课）或 banding 更新，写两张表。
+    Returns a summary dict, or None when frozen with no prior state.
+    """
+    k = int(ckpt.get("basket_k", 3))
+    enter_b = int(ckpt.get("enter_band", 3))
+    exit_b = int(ckpt.get("exit_band", 6))
+
+    row = conn.execute(
+        "SELECT date, long_assets, short_assets, all_closes FROM basket_state "
+        "WHERE date < ? ORDER BY date DESC LIMIT 1", (date,)
+    ).fetchone()
+
+    if row is None:
+        if frozen:
+            return None  # nothing to freeze; basket series starts on a live run
+        new_long, new_short = banded_update(score_dict, [], [], k, enter_b, exit_b)
+        slot_changes = 2 * k
+        cost_est = slot_changes * (0.5 / k) * (EST_COST_BPS / 10000.0)
+        conn.execute(
+            "INSERT OR REPLACE INTO basket_state VALUES (?,?,?,?,?,?)",
+            (date, json.dumps(new_long), json.dumps(new_short),
+             json.dumps(score_dict), json.dumps(closes), ckpt_name))
+        return {"date": date, "long": new_long, "short": new_short,
+                "slot_changes": slot_changes, "first": True}
+
+    prev_date, lj, sj, cj = row
+    prev_long, prev_short = json.loads(lj), json.loads(sj)
+    prev_closes = json.loads(cj)
+
+    def leg_ret(assets, sign):
+        rets = []
+        for a in assets:
+            pc, tc = prev_closes.get(a), closes.get(a)
+            if pc and tc and pc > 0:
+                rets.append(sign * (tc / pc - 1.0))
+        return sum(rets) / len(rets) if rets else 0.0
+
+    long_ret = leg_ret(prev_long, +1.0)
+    short_ret = leg_ret(prev_short, -1.0)
+    port_ret = 0.5 * long_ret + 0.5 * short_ret
+    n_days = max((datetime.strptime(date, "%Y-%m-%d")
+                  - datetime.strptime(prev_date, "%Y-%m-%d")).days, 1)
+
+    if frozen:
+        new_long, new_short = list(prev_long), list(prev_short)
+        slot_changes = 0
+    else:
+        new_long, new_short = banded_update(score_dict, prev_long, prev_short,
+                                            k, enter_b, exit_b)
+        slot_changes = (len(set(prev_long) ^ set(new_long))
+                        + len(set(prev_short) ^ set(new_short)))
+    cost_est = slot_changes * (0.5 / k) * (EST_COST_BPS / 10000.0)
+    port_net = port_ret - cost_est
+
+    cum_cur = conn.execute(
+        "SELECT cumulative_ret FROM basket_pnl WHERE date < ? "
+        "ORDER BY date DESC LIMIT 1", (date,)
+    ).fetchone()
+    prev_cum = cum_cur[0] if cum_cur else 0.0
+    cum_ret = (1 + prev_cum) * (1 + port_net) - 1.0
+
+    conn.execute(
+        "INSERT OR REPLACE INTO basket_pnl VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (date, prev_date, n_days,
+         json.dumps(prev_long), json.dumps(prev_short),
+         long_ret, short_ret, port_ret, slot_changes, cost_est, cum_ret))
+    conn.execute(
+        "INSERT OR REPLACE INTO basket_state VALUES (?,?,?,?,?,?)",
+        (date, json.dumps(new_long), json.dumps(new_short),
+         json.dumps(score_dict), json.dumps(closes),
+         ("backfill-frozen" if frozen else ckpt_name)))
+    return {"date": date, "prev_date": prev_date, "n_days": n_days,
+            "long_ret": long_ret, "short_ret": short_ret, "port_ret": port_ret,
+            "cost_est": cost_est, "cumulative_ret": cum_ret,
+            "long": new_long, "short": new_short, "slot_changes": slot_changes}
+
+
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
-    import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", default="v12",
-                   help="model version: 'v12' (default) or 'v11' (loads checkpoints/<v>_production.pt)")
+    p.add_argument("--ckpt", default="auto",
+                   help="'auto' (v13 if present, else v12), or v11/v12/v13")
+    p.add_argument("--dry-run", action="store_true",
+                   help="run everything but write nothing to the DB")
+    p.add_argument("--db", default=DB_PATH, help="database path (testing)")
     args = p.parse_args()
-    ckpt_path = f"checkpoints/{args.ckpt}_production.pt"
 
+    if args.ckpt == "auto":
+        version = "v13" if (BASE_DIR / "checkpoints" / "v13_production.pt").exists() else "v12"
+    else:
+        version = args.ckpt
+    ckpt_path = BASE_DIR / "checkpoints" / f"{version}_production.pt"
+
+    now_utc = datetime.now(timezone.utc)
     print("=" * 60)
     print("  Daily Paper Trading — Batch Mode")
-    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Model: {ckpt_path}")
+    print(f"  {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+          + ("  [DRY RUN]" if args.dry_run else ""))
+    print(f"  Model: {ckpt_path.name}   DB: {Path(args.db).name}")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    conn = init_db()
+    conn = init_db(args.db)
+    today = utc_today()
 
-    # Step 1: Fetch latest bars / 获取最新K线
-    print("\n[1/4] Fetching latest 1h bars ...")
-    bars = fetch_bars(SYMBOLS, n_bars=50)
-    print(f"  Got {len(bars)} symbols")
+    # gap detection BEFORE fetch so we pull enough history / 先测断档再定拉取量
+    last_date = last_recorded_date(conn)
+    missed: List[str] = date_range_exclusive(last_date, today) if last_date else []
+    if len(missed) > MAX_BACKFILL_DAYS:
+        print(f"  WARNING: {len(missed)} missed days > {MAX_BACKFILL_DAYS} cap — "
+              f"backfilling only the most recent {MAX_BACKFILL_DAYS} (series break).")
+        missed = missed[-MAX_BACKFILL_DAYS:]
+    n_bars = min(N_BARS_BASE + 24 * (len(missed) + 1), N_BARS_MAX)
 
-    # Step 2: Reconcile yesterday / 对账昨日
-    print("\n[2/4] Reconciling yesterday's signal ...")
-    recon = reconcile(conn, bars)
-    if recon:
-        print(f"  Yesterday: long={recon['long']} ({recon['long_ret']:+.4%}) "
-              f"short={recon['short']} ({recon['short_ret']:+.4%})")
-        print(f"  Portfolio return: {recon['port_ret']:+.4%}")
-        print(f"  Cumulative: {recon['cumulative_ret']:+.4%}")
+    print(f"\n[1/5] Fetching latest {n_bars} closed 1h bars "
+          f"({len(missed)} missed day(s) to backfill) ...")
+    bars = fetch_bars(SYMBOLS, n_bars)
+    print(f"  Got all {len(bars)} symbols")
+
+    ckpt = load_checkpoint(ckpt_path, device)
+    is_v13 = bool(ckpt.get("label_horizon"))
+    seq_len = int(ckpt["seq_len"])
+
+    funding = None
+    if ckpt.get("needs_real_funding"):
+        print("\n[2/5] Fetching real funding-rate history ...")
+        funding = fetch_funding(SYMBOLS, bars, device)
     else:
-        print("  No previous signal to reconcile (first run)")
+        print("\n[2/5] Funding fetch skipped (ckpt does not require it)")
 
-    # Step 3: Run inference / 运行推理
-    print("\n[3/4] Running model inference ...")
-    score_dict, closes = run_inference(bars, device, ckpt_path=ckpt_path)
+    print("\n[3/5] Building features + model ...")
+    print(f"  Loaded {ckpt_path.name} (val_corr={ckpt['val_corr']:.4f}, "
+          f"{ckpt['n_factors']} factors"
+          + (f", label={ckpt.get('label_horizon')}h" if is_v13 else "") + ")")
+    feats = build_features(bars, ckpt, device, funding)
+    model = build_model(ckpt, device)
+
+    # ---- Backfill missed days (signals recorded; basket FROZEN) ----
+    # ---- 补课：缺失日重算信号入库；篮子持仓冻结，仅补每日PnL ----
+    print(f"\n[4/5] Review & backfill ({len(missed)} missed day(s)) ...")
+    n_backfilled = 0
+    for d in missed:
+        idx_map = mark_indices_for_date(feats, d)
+        if idx_map is None:
+            print(f"  [backfill {d}] SKIP — insufficient bars around the "
+                  f"{MARK_HOUR_UTC:02d}:00 UTC mark")
+            continue
+        sc_d, cl_d = score_at_indices(feats, model, seq_len, idx_map)
+        if not args.dry_run:
+            rec = reconcile_legacy(conn, cl_d, d)
+            write_signal_row(conn, d, sc_d, cl_d)
+            binfo = basket_step(conn, d, sc_d, cl_d, ckpt, ckpt_path.name,
+                                frozen=True) if is_v13 else None
+            conn.commit()
+            msg = f"  [backfill {d}] signal logged"
+            if rec:
+                msg += f"; legacy port {rec['port_ret']:+.4%}"
+            if binfo:
+                msg += (f"; basket(frozen) {binfo['port_ret']:+.4%} "
+                        f"cum {binfo['cumulative_ret']:+.4%}")
+            print(msg)
+        else:
+            ranked = sorted(sc_d.items(), key=lambda x: x[1], reverse=True)
+            print(f"  [backfill {d}] (dry) top={ranked[0][0]} bottom={ranked[-1][0]}")
+        n_backfilled += 1
+    if not missed:
+        print("  No gap — last record is "
+              + (f"{last_date}" if last_date else "absent (first run)"))
+
+    # ---- Today's signal / 今日信号 ----
+    today_idx = {sym: len(feats[sym]["ts"]) - 1 for sym in feats}
+    score_dict, closes = score_at_indices(feats, model, seq_len, today_idx)
     sorted_scores = sorted(score_dict.items(), key=lambda x: x[1], reverse=True)
-    long_asset = sorted_scores[0][0]
-    short_asset = sorted_scores[-1][0]
+    long1, short1 = sorted_scores[0][0], sorted_scores[-1][0]
 
-    print(f"\n  TODAY'S SIGNAL / 今日信号:")
-    print(f"    LONG:  {long_asset} (score={score_dict[long_asset]:.4f}, "
-          f"close=${closes[long_asset]:,.2f})")
-    print(f"    SHORT: {short_asset} (score={score_dict[short_asset]:.4f}, "
-          f"close=${closes[short_asset]:,.2f})")
-    print(f"\n  Full ranking / 完整排名:")
+    recon = None
+    basket_info = None
+    if not args.dry_run:
+        recon = reconcile_legacy(conn, closes, today)
+        write_signal_row(conn, today, score_dict, closes)
+        if is_v13:
+            basket_info = basket_step(conn, today, score_dict, closes,
+                                      ckpt, ckpt_path.name, frozen=False)
+        conn.commit()
+    elif is_v13:
+        # dry-run preview of the banded update / 干跑时也预览篮子更新
+        row = conn.execute(
+            "SELECT long_assets, short_assets FROM basket_state "
+            "WHERE date < ? ORDER BY date DESC LIMIT 1", (today,)).fetchone()
+        pl_, ps_ = (json.loads(row[0]), json.loads(row[1])) if row else ([], [])
+        nl, ns = banded_update(score_dict, pl_, ps_,
+                               int(ckpt.get("basket_k", 3)),
+                               int(ckpt.get("enter_band", 3)),
+                               int(ckpt.get("exit_band", 6)))
+        basket_info = {"long": nl, "short": ns,
+                       "slot_changes": (len(set(pl_) ^ set(nl))
+                                        + len(set(ps_) ^ set(ns)))}
+
+    if recon:
+        print(f"\n  [reconcile] {recon['prev_date']} -> {today}: "
+              f"legacy port {recon['port_ret']:+.4%}, "
+              f"cum {recon['cumulative_ret']:+.4%}")
+    if basket_info and "port_ret" in basket_info:
+        print(f"  [basket] {basket_info['prev_date']} -> {today}: "
+              f"port {basket_info['port_ret']:+.4%} "
+              f"(cost est {basket_info['cost_est']:.4%}), "
+              f"cum {basket_info['cumulative_ret']:+.4%}")
+
+    print("\n  TODAY'S SIGNAL / 今日信号:")
+    if basket_info:
+        print(f"    LONG  basket: {basket_info['long']}")
+        print(f"    SHORT basket: {basket_info['short']}")
+        print(f"    slot changes: {basket_info['slot_changes']}")
+    else:
+        print(f"    LONG:  {long1} (score={score_dict[long1]:+.4f})")
+        print(f"    SHORT: {short1} (score={score_dict[short1]:+.4f})")
+    print("\n  Full ranking / 完整排名:")
     for i, (sym, sc) in enumerate(sorted_scores):
-        marker = " ← LONG" if i == 0 else (" ← SHORT" if i == len(sorted_scores)-1 else "")
-        print(f"    {i+1:2d}. {sym:12s} {sc:+.4f}{marker}")
+        tag = ""
+        if basket_info:
+            if sym in basket_info["long"]:
+                tag = " <- LONG"
+            elif sym in basket_info["short"]:
+                tag = " <- SHORT"
+        else:
+            tag = " <- LONG" if i == 0 else (" <- SHORT" if i == len(sorted_scores) - 1 else "")
+        print(f"    {i+1:2d}. {sym:12s} {sc:+.4f}{tag}")
 
-    # Step 4: Log signal / 记录信号
-    today = datetime.now().strftime("%Y-%m-%d")
-    conn.execute(
-        "INSERT INTO daily_signals VALUES (?,?,?,?,?,?,?,?)",
-        (today, long_asset, short_asset,
-         score_dict[long_asset], score_dict[short_asset],
-         closes[long_asset], closes[short_asset],
-         json.dumps(score_dict)),
-    )
-    conn.commit()
     conn.close()
-
-    print(f"\n[4/4] Logged to {DB_PATH}")
-    print("[DONE] Run again tomorrow!")
+    print(f"\n[5/5] {'DRY RUN — nothing written' if args.dry_run else f'Logged to {args.db}'}"
+          + (f' (backfilled {n_backfilled} day(s))' if n_backfilled else ''))
+    print("[DONE]")
 
 
 if __name__ == "__main__":

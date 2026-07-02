@@ -34,4 +34,5 @@ venv/
 
 # Machine-local (hardcoded paths / scheduler output)
 run_paper_daily_scheduled.bat
+run_paper_daily_hidden.vbs
 paper_daily_log.txt

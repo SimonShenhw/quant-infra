@@ -56,6 +56,16 @@ MARK_HOUR_UTC: int = 23      # daily mark = close of the 22:00-23:00 UTC bar (~1
 MAX_BACKFILL_DAYS: int = 28  # beyond this, declare a break instead of backfilling / 超过则视为断档
 EST_COST_BPS: float = 8.0    # per traded slot notional (fee+slippage est.) / 每槽位成本估计
 
+# Carry sleeve (Phase 0, ROADMAP_2026-07-13): banded funding carry, model-free.
+# Signal = NEGATIVE trailing 3d mean funding (long low/negative funding perps,
+# short high-funding ones — shorts COLLECT positive funding). Same banding
+# params as the model basket. See RESEARCH_2026-07-02.md variant D.
+# carry sleeve：3日均funding取负做信号，与模型篮子同banding参数，不依赖模型。
+CARRY_LOOKBACK: int = 72     # bars (3 days) / 信号回看窗口
+CARRY_K: int = 3
+CARRY_ENTER: int = 3
+CARRY_EXIT: int = 6
+
 # Match run_v12_final.py's training drops; v13 ckpts carry factor_names.
 DROP_FACTORS_FALLBACK = {"volume_zscore", "volume_momentum", "macd", "klow"}
 
@@ -102,6 +112,25 @@ def init_db(db_path: str) -> sqlite3.Connection:
             prev_long TEXT, prev_short TEXT,
             long_ret REAL, short_ret REAL, port_ret REAL,
             slot_changes INTEGER, cost_est REAL,
+            cumulative_ret REAL
+        );
+        CREATE TABLE IF NOT EXISTS carry_state (
+            date TEXT PRIMARY KEY, mark_ts INTEGER,
+            long_assets TEXT, short_assets TEXT,
+            all_signals TEXT, all_closes TEXT
+        );
+        CREATE TABLE IF NOT EXISTS carry_pnl (
+            date TEXT PRIMARY KEY,
+            prev_date TEXT, n_days INTEGER,
+            prev_long TEXT, prev_short TEXT,
+            long_ret REAL, short_ret REAL, port_ret REAL,
+            funding_pnl REAL,
+            slot_changes INTEGER, cost_est REAL,
+            cumulative_ret REAL
+        );
+        CREATE TABLE IF NOT EXISTS combo_pnl (
+            date TEXT PRIMARY KEY, prev_date TEXT,
+            model_net REAL, carry_net REAL, combo_ret REAL,
             cumulative_ret REAL
         );
     """)
@@ -521,6 +550,149 @@ def basket_step(
 
 
 # ============================================================================
+# Carry sleeve (Phase 0) — model-free funding carry, own ledger
+# carry sleeve：不依赖模型的资金费率carry，独立账本
+# ============================================================================
+
+def carry_signal_at(
+    funding: Dict[str, Tensor], feats: Dict[str, dict], idx_map: Dict[str, int],
+) -> Optional[Dict[str, float]]:
+    """NEGATIVE trailing mean funding per asset at each symbol's mark index.
+    各标的在mark时点的3日均funding取负。Returns None if funding is unusable."""
+    sig: Dict[str, float] = {}
+    for sym, i in idx_map.items():
+        f = funding.get(sym)
+        if f is None or f.numel() != len(feats[sym]["ts"]):
+            return None
+        lo = max(i - CARRY_LOOKBACK + 1, 0)
+        sig[sym] = -float(f[lo:i + 1].mean().item())
+    if all(v == 0.0 for v in sig.values()):
+        return None  # funding fetch degraded to zeros — no carry signal / 全零无信号
+    return sig
+
+
+def funding_accrual_between(
+    funding: Dict[str, Tensor], feats: Dict[str, dict],
+    prev_mark_ts: int, cur_mark_ts: int,
+) -> Dict[str, float]:
+    """Approximate funding paid by a LONG holder of each asset between marks:
+    sum of forward-filled hourly rates / 8 (8h event cadence). Shorts receive.
+    两个mark之间多头支付的funding近似值（小时ffill费率求和/8）；空头收取。"""
+    acc: Dict[str, float] = {}
+    for sym, d in feats.items():
+        f = funding.get(sym)
+        if f is None:
+            acc[sym] = 0.0
+            continue
+        ts = d["ts"]
+        mask = (ts > prev_mark_ts) & (ts <= cur_mark_ts)
+        acc[sym] = float(f.cpu().numpy()[mask].sum() / 8.0)
+    return acc
+
+
+def carry_step(
+    conn, date: str, sig: Dict[str, float], closes: Dict[str, float],
+    mark_ts: int, funding: Dict[str, Tensor], feats: Dict[str, dict],
+    frozen: bool,
+) -> Optional[Dict]:
+    """One carry-ledger day: reconcile (price + funding accrual) vs previous
+    carry_state, then freeze (backfill) or apply the banded update.
+    carry账本单日推进：对账（价格+funding计提）→ 冻结或banding更新。"""
+    row = conn.execute(
+        "SELECT date, mark_ts, long_assets, short_assets, all_closes "
+        "FROM carry_state WHERE date < ? ORDER BY date DESC LIMIT 1", (date,)
+    ).fetchone()
+
+    if row is None:
+        if frozen:
+            return None
+        new_l, new_s = banded_update(sig, [], [], CARRY_K, CARRY_ENTER, CARRY_EXIT)
+        conn.execute(
+            "INSERT OR REPLACE INTO carry_state VALUES (?,?,?,?,?,?)",
+            (date, mark_ts, json.dumps(new_l), json.dumps(new_s),
+             json.dumps(sig), json.dumps(closes)))
+        return {"date": date, "long": new_l, "short": new_s,
+                "slot_changes": 2 * CARRY_K, "first": True}
+
+    prev_date, prev_mark_ts, lj, sj, cj = row
+    prev_long, prev_short = json.loads(lj), json.loads(sj)
+    prev_closes = json.loads(cj)
+    acc = funding_accrual_between(funding, feats, int(prev_mark_ts), mark_ts)
+
+    def leg_ret(assets, sign):
+        rets = []
+        for a in assets:
+            pc, tc = prev_closes.get(a), closes.get(a)
+            if pc and tc and pc > 0:
+                rets.append(sign * (tc / pc - 1.0) - sign * acc.get(a, 0.0))
+        return sum(rets) / len(rets) if rets else 0.0
+
+    long_ret = leg_ret(prev_long, +1.0)   # longs PAY positive funding / 多头付
+    short_ret = leg_ret(prev_short, -1.0)  # shorts RECEIVE it / 空头收
+    port_ret = 0.5 * long_ret + 0.5 * short_ret
+    fund_pnl = (0.5 * (sum(-acc.get(a, 0.0) for a in prev_long) / max(len(prev_long), 1))
+                + 0.5 * (sum(+acc.get(a, 0.0) for a in prev_short) / max(len(prev_short), 1)))
+    n_days = max((datetime.strptime(date, "%Y-%m-%d")
+                  - datetime.strptime(prev_date, "%Y-%m-%d")).days, 1)
+
+    if frozen:
+        new_l, new_s = list(prev_long), list(prev_short)
+        slot_changes = 0
+    else:
+        new_l, new_s = banded_update(sig, prev_long, prev_short,
+                                     CARRY_K, CARRY_ENTER, CARRY_EXIT)
+        slot_changes = (len(set(prev_long) ^ set(new_l))
+                        + len(set(prev_short) ^ set(new_s)))
+    cost_est = slot_changes * (0.5 / CARRY_K) * (EST_COST_BPS / 10000.0)
+
+    cum_cur = conn.execute(
+        "SELECT cumulative_ret FROM carry_pnl WHERE date < ? "
+        "ORDER BY date DESC LIMIT 1", (date,)).fetchone()
+    prev_cum = cum_cur[0] if cum_cur else 0.0
+    cum_ret = (1 + prev_cum) * (1 + port_ret - cost_est) - 1.0
+
+    conn.execute(
+        "INSERT OR REPLACE INTO carry_pnl VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (date, prev_date, n_days,
+         json.dumps(prev_long), json.dumps(prev_short),
+         long_ret, short_ret, port_ret, fund_pnl,
+         slot_changes, cost_est, cum_ret))
+    conn.execute(
+        "INSERT OR REPLACE INTO carry_state VALUES (?,?,?,?,?,?)",
+        (date, mark_ts, json.dumps(new_l), json.dumps(new_s),
+         json.dumps(sig), json.dumps(closes)))
+    return {"date": date, "prev_date": prev_date, "n_days": n_days,
+            "long_ret": long_ret, "short_ret": short_ret, "port_ret": port_ret,
+            "funding_pnl": fund_pnl, "cost_est": cost_est,
+            "cumulative_ret": cum_ret,
+            "long": new_l, "short": new_s, "slot_changes": slot_changes}
+
+
+def combo_step(conn, date: str) -> Optional[Dict]:
+    """Pure bookkeeping 50/50 ledger of the two sleeves' NET daily returns.
+    Linear approximation (no capital netting) — see ROADMAP Phase 3.
+    纯记账的50/50虚拟账本（线性近似，未做资金净额结算）。"""
+    b = conn.execute("SELECT port_ret, cost_est FROM basket_pnl WHERE date=?",
+                     (date,)).fetchone()
+    c = conn.execute("SELECT port_ret, cost_est FROM carry_pnl WHERE date=?",
+                     (date,)).fetchone()
+    if b is None or c is None:
+        return None
+    model_net = b[0] - b[1]
+    carry_net = c[0] - c[1]
+    combo = 0.5 * model_net + 0.5 * carry_net
+    prev = conn.execute(
+        "SELECT date, cumulative_ret FROM combo_pnl WHERE date < ? "
+        "ORDER BY date DESC LIMIT 1", (date,)).fetchone()
+    prev_date, prev_cum = (prev[0], prev[1]) if prev else (None, 0.0)
+    cum = (1 + prev_cum) * (1 + combo) - 1.0
+    conn.execute("INSERT OR REPLACE INTO combo_pnl VALUES (?,?,?,?,?,?)",
+                 (date, prev_date, model_net, carry_net, combo, cum))
+    return {"model_net": model_net, "carry_net": carry_net,
+            "combo_ret": combo, "cumulative_ret": cum}
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -569,12 +741,10 @@ def main():
     is_v13 = bool(ckpt.get("label_horizon"))
     seq_len = int(ckpt["seq_len"])
 
-    funding = None
-    if ckpt.get("needs_real_funding"):
-        print("\n[2/5] Fetching real funding-rate history ...")
-        funding = fetch_funding(SYMBOLS, bars, device)
-    else:
-        print("\n[2/5] Funding fetch skipped (ckpt does not require it)")
+    # funding is needed unconditionally now: model extras (v13 ckpt) AND the
+    # carry sleeve both consume it / funding现在无条件抓取：模型extras与carry都用
+    print("\n[2/5] Fetching real funding-rate history (model extras + carry) ...")
+    funding = fetch_funding(SYMBOLS, bars, device) or {}
 
     print("\n[3/5] Building features + model ...")
     print(f"  Loaded {ckpt_path.name} (val_corr={ckpt['val_corr']:.4f}, "
@@ -599,6 +769,14 @@ def main():
             write_signal_row(conn, d, sc_d, cl_d)
             binfo = basket_step(conn, d, sc_d, cl_d, ckpt, ckpt_path.name,
                                 frozen=True) if is_v13 else None
+            # carry ledger: positions frozen on missed days too / carry补课同样冻结
+            mark_open_ms = int(datetime.strptime(d, "%Y-%m-%d")
+                               .replace(tzinfo=timezone.utc, hour=MARK_HOUR_UTC - 1)
+                               .timestamp() * 1000)
+            csig_d = carry_signal_at(funding, feats, idx_map)
+            cinfo = (carry_step(conn, d, csig_d, cl_d, mark_open_ms, funding,
+                                feats, frozen=True) if csig_d else None)
+            combo_step(conn, d)
             conn.commit()
             msg = f"  [backfill {d}] signal logged"
             if rec:
@@ -606,6 +784,8 @@ def main():
             if binfo:
                 msg += (f"; basket(frozen) {binfo['port_ret']:+.4%} "
                         f"cum {binfo['cumulative_ret']:+.4%}")
+            if cinfo and "port_ret" in cinfo:
+                msg += f"; carry(frozen) {cinfo['port_ret']:+.4%}"
             print(msg)
         else:
             ranked = sorted(sc_d.items(), key=lambda x: x[1], reverse=True)
@@ -621,14 +801,26 @@ def main():
     sorted_scores = sorted(score_dict.items(), key=lambda x: x[1], reverse=True)
     long1, short1 = sorted_scores[0][0], sorted_scores[-1][0]
 
+    today_mark_ts = int(min(feats[sym]["ts"][-1] for sym in feats))
+    carry_sig = carry_signal_at(funding, feats, today_idx)
+
     recon = None
     basket_info = None
+    carry_info = None
+    combo_info = None
     if not args.dry_run:
         recon = reconcile_legacy(conn, closes, today)
         write_signal_row(conn, today, score_dict, closes)
         if is_v13:
             basket_info = basket_step(conn, today, score_dict, closes,
                                       ckpt, ckpt_path.name, frozen=False)
+        if carry_sig:
+            carry_info = carry_step(conn, today, carry_sig, closes,
+                                    today_mark_ts, funding, feats, frozen=False)
+            combo_info = combo_step(conn, today)
+        else:
+            print("  WARNING: carry signal unavailable (funding degraded) — "
+                  "carry ledger skipped today")
         conn.commit()
     elif is_v13:
         # dry-run preview of the banded update / 干跑时也预览篮子更新
@@ -653,15 +845,33 @@ def main():
               f"port {basket_info['port_ret']:+.4%} "
               f"(cost est {basket_info['cost_est']:.4%}), "
               f"cum {basket_info['cumulative_ret']:+.4%}")
+    if carry_info and "port_ret" in carry_info:
+        print(f"  [carry]  {carry_info['prev_date']} -> {today}: "
+              f"port {carry_info['port_ret']:+.4%} "
+              f"(funding {carry_info['funding_pnl']:+.4%}, "
+              f"cost est {carry_info['cost_est']:.4%}), "
+              f"cum {carry_info['cumulative_ret']:+.4%}")
+    if combo_info:
+        print(f"  [combo]  50/50 model+carry: {combo_info['combo_ret']:+.4%}, "
+              f"cum {combo_info['cumulative_ret']:+.4%}")
 
     print("\n  TODAY'S SIGNAL / 今日信号:")
     if basket_info:
-        print(f"    LONG  basket: {basket_info['long']}")
-        print(f"    SHORT basket: {basket_info['short']}")
-        print(f"    slot changes: {basket_info['slot_changes']}")
+        print(f"    [model] LONG  basket: {basket_info['long']}")
+        print(f"    [model] SHORT basket: {basket_info['short']}")
+        print(f"    [model] slot changes: {basket_info['slot_changes']}")
     else:
         print(f"    LONG:  {long1} (score={score_dict[long1]:+.4f})")
         print(f"    SHORT: {short1} (score={score_dict[short1]:+.4f})")
+    if carry_sig:
+        if carry_info:
+            print(f"    [carry] LONG  basket: {carry_info['long']}")
+            print(f"    [carry] SHORT basket: {carry_info['short']}")
+        else:
+            ranked_c = sorted(carry_sig.items(), key=lambda x: x[1], reverse=True)
+            nl_c = sorted(s for s, _ in ranked_c[:CARRY_K])
+            ns_c = sorted(s for s, _ in ranked_c[-CARRY_K:])
+            print(f"    [carry] (preview) LONG {nl_c} SHORT {ns_c}")
     print("\n  Full ranking / 完整排名:")
     for i, (sym, sc) in enumerate(sorted_scores):
         tag = ""

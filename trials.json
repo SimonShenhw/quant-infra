@@ -65,6 +65,24 @@
           "vol_high"
         ]
       }
+    },
+    {
+      "name": "extended_window_2026-07-13/FULL",
+      "ts": "2026-07-13T15:48:15Z",
+      "meta": {
+        "kind": "retrain",
+        "symbols": 16,
+        "factors": 18
+      }
+    },
+    {
+      "name": "extended_window_2026-07-13/CTRL",
+      "ts": "2026-07-13T15:54:28Z",
+      "meta": {
+        "kind": "retrain",
+        "symbols": 16,
+        "factors": 18
+      }
     }
   ]
 }

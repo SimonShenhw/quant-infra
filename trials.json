@@ -83,6 +83,54 @@
         "symbols": 16,
         "factors": 18
       }
+    },
+    {
+      "name": "rank_weighted_2026-07-13/A_band_top3_flat8",
+      "ts": "2026-07-13T17:59:36Z",
+      "meta": {
+        "kind": "construction",
+        "cost_bps": 8.0
+      }
+    },
+    {
+      "name": "rank_weighted_2026-07-13/B_rankw_full",
+      "ts": "2026-07-13T17:59:36Z",
+      "meta": {
+        "kind": "construction",
+        "cost_bps": 8.0
+      }
+    },
+    {
+      "name": "rank_weighted_2026-07-13/C_rankw_tau_1_3",
+      "ts": "2026-07-13T17:59:36Z",
+      "meta": {
+        "kind": "construction",
+        "cost_bps": 8.0
+      }
+    },
+    {
+      "name": "rank_weighted_2026-07-13/D_rankw_tau_1_5",
+      "ts": "2026-07-13T17:59:36Z",
+      "meta": {
+        "kind": "construction",
+        "cost_bps": 8.0
+      }
+    },
+    {
+      "name": "rank_weighted_2026-07-13/E_rankw_vol_full",
+      "ts": "2026-07-13T18:06:16Z",
+      "meta": {
+        "kind": "construction",
+        "cost_bps": 8.0
+      }
+    },
+    {
+      "name": "rank_weighted_2026-07-13/F_rankw_vol_tau_1_5",
+      "ts": "2026-07-13T18:06:16Z",
+      "meta": {
+        "kind": "construction",
+        "cost_bps": 8.0
+      }
     }
   ]
 }

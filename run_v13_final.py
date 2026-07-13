@@ -308,36 +308,11 @@ def split_train_val(train_idx: np.ndarray, seq_len: int) -> Tuple[np.ndarray, np
 # Backtest engine: banded top-K long-short with next-bar effect (H-1 fix)
 # ============================================================================
 
-def _banded_targets(
-    scores: np.ndarray,
-    long_set: Set[int], short_set: Set[int],
-    k: int, enter_band: int, exit_band: int,
-) -> Tuple[Set[int], Set[int]]:
-    """Novy-Marx-Velikov buy/hold band update for both legs.
-    买入/持有双阈值更新（两腿对称）。"""
-    A = len(scores)
-    order = np.argsort(-scores)             # best -> worst
-    rank_of = np.empty(A, dtype=np.int64)
-    rank_of[order] = np.arange(A)
-
-    kept_l = {a for a in long_set if rank_of[a] < exit_band}
-    kept_s = {a for a in short_set if rank_of[a] >= A - exit_band}
-
-    new_l = set(kept_l)
-    for a in order[:enter_band]:
-        if len(new_l) >= k:
-            break
-        if a not in new_l and a not in kept_s:
-            new_l.add(a)
-
-    new_s = set(kept_s)
-    for a in order[::-1][:enter_band]:
-        if len(new_s) >= k:
-            break
-        if a not in new_s and a not in new_l:
-            new_s.add(a)
-
-    return new_l, new_s
+# Banding now lives in the shared sleeves package (used by backtest, paper
+# trading, and research alike) — single implementation, tested by
+# tests/run_invariants.py. Name kept for research-script imports.
+# banding 移入共享 sleeves 包（回测/模拟盘/研究共用一份实现）。
+from sleeves.banding import banded_targets as _banded_targets  # noqa: E402
 
 
 def run_backtest(

@@ -39,6 +39,8 @@ sys.path.insert(0, str(BASE_DIR))
 import factors as _  # trigger auto-discover / 触发自动发现
 from factors.base import FactorRegistry
 from model.cross_asset_attention import CrossAssetGRUAttention
+from sleeves import CarrySleeve, ModelSleeve, PortfolioBook
+from sleeves.banding import banded_update_symbols
 
 DB_PATH: str = str(BASE_DIR / "paper_daily.db")
 
@@ -335,24 +337,9 @@ def build_features(
     return feats
 
 
-def score_at_indices(
-    feats: Dict[str, dict], model, seq_len: int, idx_map: Dict[str, int],
-) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """Inference using each symbol's bars up to (and incl.) idx_map[sym].
-    用每标的截至 idx_map[sym] 的数据推理。Returns (scores, closes)."""
-    syms = sorted(feats.keys())
-    xs, closes = [], {}
-    for sym in syms:
-        i = idx_map[sym]
-        f = feats[sym]["factors"][: i + 1]
-        if f.size(0) < seq_len:
-            raise ValueError(f"{sym}: only {f.size(0)} bars before mark, need {seq_len}")
-        xs.append(f[-seq_len:])
-        closes[sym] = float(feats[sym]["closes"][i])
-    x = torch.stack(xs, dim=0).unsqueeze(0)
-    with torch.no_grad():
-        scores = model(x).squeeze(0)
-    return {syms[i]: scores[i].item() for i in range(len(syms))}, closes
+def closes_at(feats: Dict[str, dict], idx_map: Dict[str, int]) -> Dict[str, float]:
+    """Close price per symbol at its mark index. / 各标的在mark索引处的收盘价。"""
+    return {sym: float(feats[sym]["closes"][idx_map[sym]]) for sym in feats}
 
 
 def mark_indices_for_date(
@@ -379,40 +366,17 @@ def mark_indices_for_date(
 
 
 # ============================================================================
-# Banded basket update (mirrors run_v13_final._banded_targets)
+# Banding + ledgers now live in the shared sleeves package (ROADMAP Phase 1);
+# these names are kept as the stable public surface of this module.
+# banding与账本移入共享sleeves包；此处保留同名入口保持兼容。
 # ============================================================================
 
-def banded_update(
-    score_dict: Dict[str, float],
-    prev_long: List[str], prev_short: List[str],
-    k: int, enter_band: int, exit_band: int,
-) -> Tuple[List[str], List[str]]:
-    syms = sorted(score_dict.keys())
-    scores = np.asarray([score_dict[s] for s in syms])
-    A = len(syms)
-    order = np.argsort(-scores)
-    rank_of = {syms[a]: int(np.where(order == a)[0][0]) for a in range(A)}
+banded_update = banded_update_symbols
 
-    kept_l = [s for s in prev_long if s in rank_of and rank_of[s] < exit_band]
-    kept_s = [s for s in prev_short if s in rank_of and rank_of[s] >= A - exit_band]
-
-    new_l = list(kept_l)
-    for a in order[:enter_band]:
-        s = syms[a]
-        if len(new_l) >= k:
-            break
-        if s not in new_l and s not in kept_s:
-            new_l.append(s)
-
-    new_s = list(kept_s)
-    for a in order[::-1][:enter_band]:
-        s = syms[a]
-        if len(new_s) >= k:
-            break
-        if s not in new_s and s not in new_l:
-            new_s.append(s)
-
-    return sorted(new_l), sorted(new_s)
+MODEL_BOOK = PortfolioBook("basket", "basket_state", "basket_pnl",
+                           cost_bps=EST_COST_BPS)
+CARRY_BOOK = PortfolioBook("carry", "carry_state", "carry_pnl",
+                           cost_bps=EST_COST_BPS)
 
 
 # ============================================================================
@@ -469,84 +433,15 @@ def basket_step(
     conn, date: str, score_dict: Dict[str, float], closes: Dict[str, float],
     ckpt: dict, ckpt_name: str, frozen: bool,
 ) -> Optional[Dict]:
-    """
-    One basket day: reconcile vs previous basket_state, then either freeze
-    positions (backfill) or apply the banded update, and write both rows.
-    篮子单日推进：先对账，再冻结（补课）或 banding 更新，写两张表。
-    Returns a summary dict, or None when frozen with no prior state.
-    """
-    k = int(ckpt.get("basket_k", 3))
-    enter_b = int(ckpt.get("enter_band", 3))
-    exit_b = int(ckpt.get("exit_band", 6))
-
-    row = conn.execute(
-        "SELECT date, long_assets, short_assets, all_closes FROM basket_state "
-        "WHERE date < ? ORDER BY date DESC LIMIT 1", (date,)
-    ).fetchone()
-
-    if row is None:
-        if frozen:
-            return None  # nothing to freeze; basket series starts on a live run
-        new_long, new_short = banded_update(score_dict, [], [], k, enter_b, exit_b)
-        slot_changes = 2 * k
-        cost_est = slot_changes * (0.5 / k) * (EST_COST_BPS / 10000.0)
-        conn.execute(
-            "INSERT OR REPLACE INTO basket_state VALUES (?,?,?,?,?,?)",
-            (date, json.dumps(new_long), json.dumps(new_short),
-             json.dumps(score_dict), json.dumps(closes), ckpt_name))
-        return {"date": date, "long": new_long, "short": new_short,
-                "slot_changes": slot_changes, "first": True}
-
-    prev_date, lj, sj, cj = row
-    prev_long, prev_short = json.loads(lj), json.loads(sj)
-    prev_closes = json.loads(cj)
-
-    def leg_ret(assets, sign):
-        rets = []
-        for a in assets:
-            pc, tc = prev_closes.get(a), closes.get(a)
-            if pc and tc and pc > 0:
-                rets.append(sign * (tc / pc - 1.0))
-        return sum(rets) / len(rets) if rets else 0.0
-
-    long_ret = leg_ret(prev_long, +1.0)
-    short_ret = leg_ret(prev_short, -1.0)
-    port_ret = 0.5 * long_ret + 0.5 * short_ret
-    n_days = max((datetime.strptime(date, "%Y-%m-%d")
-                  - datetime.strptime(prev_date, "%Y-%m-%d")).days, 1)
-
-    if frozen:
-        new_long, new_short = list(prev_long), list(prev_short)
-        slot_changes = 0
-    else:
-        new_long, new_short = banded_update(score_dict, prev_long, prev_short,
-                                            k, enter_b, exit_b)
-        slot_changes = (len(set(prev_long) ^ set(new_long))
-                        + len(set(prev_short) ^ set(new_short)))
-    cost_est = slot_changes * (0.5 / k) * (EST_COST_BPS / 10000.0)
-    port_net = port_ret - cost_est
-
-    cum_cur = conn.execute(
-        "SELECT cumulative_ret FROM basket_pnl WHERE date < ? "
-        "ORDER BY date DESC LIMIT 1", (date,)
-    ).fetchone()
-    prev_cum = cum_cur[0] if cum_cur else 0.0
-    cum_ret = (1 + prev_cum) * (1 + port_net) - 1.0
-
-    conn.execute(
-        "INSERT OR REPLACE INTO basket_pnl VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (date, prev_date, n_days,
-         json.dumps(prev_long), json.dumps(prev_short),
-         long_ret, short_ret, port_ret, slot_changes, cost_est, cum_ret))
-    conn.execute(
-        "INSERT OR REPLACE INTO basket_state VALUES (?,?,?,?,?,?)",
-        (date, json.dumps(new_long), json.dumps(new_short),
-         json.dumps(score_dict), json.dumps(closes),
-         ("backfill-frozen" if frozen else ckpt_name)))
-    return {"date": date, "prev_date": prev_date, "n_days": n_days,
-            "long_ret": long_ret, "short_ret": short_ret, "port_ret": port_ret,
-            "cost_est": cost_est, "cumulative_ret": cum_ret,
-            "long": new_long, "short": new_short, "slot_changes": slot_changes}
+    """Model-sleeve ledger day — delegates to the shared PortfolioBook.
+    模型sleeve账本单日推进——委托共享PortfolioBook。"""
+    return MODEL_BOOK.step(
+        conn, date, score_dict, closes,
+        k=int(ckpt.get("basket_k", 3)),
+        enter_band=int(ckpt.get("enter_band", 3)),
+        exit_band=int(ckpt.get("exit_band", 6)),
+        frozen=frozen,
+        tag=("backfill-frozen" if frozen else ckpt_name))
 
 
 # ============================================================================
@@ -554,21 +449,15 @@ def basket_step(
 # carry sleeve：不依赖模型的资金费率carry，独立账本
 # ============================================================================
 
+CARRY_SLEEVE = CarrySleeve(lookback=CARRY_LOOKBACK, k=CARRY_K,
+                           enter_band=CARRY_ENTER, exit_band=CARRY_EXIT)
+
+
 def carry_signal_at(
     funding: Dict[str, Tensor], feats: Dict[str, dict], idx_map: Dict[str, int],
 ) -> Optional[Dict[str, float]]:
-    """NEGATIVE trailing mean funding per asset at each symbol's mark index.
-    各标的在mark时点的3日均funding取负。Returns None if funding is unusable."""
-    sig: Dict[str, float] = {}
-    for sym, i in idx_map.items():
-        f = funding.get(sym)
-        if f is None or f.numel() != len(feats[sym]["ts"]):
-            return None
-        lo = max(i - CARRY_LOOKBACK + 1, 0)
-        sig[sym] = -float(f[lo:i + 1].mean().item())
-    if all(v == 0.0 for v in sig.values()):
-        return None  # funding fetch degraded to zeros — no carry signal / 全零无信号
-    return sig
+    """Carry sleeve scores (delegates to sleeves.CarrySleeve). / 委托CarrySleeve。"""
+    return CARRY_SLEEVE.compute_scores(feats, funding, idx_map)
 
 
 def funding_accrual_between(
@@ -595,77 +484,14 @@ def carry_step(
     mark_ts: int, funding: Dict[str, Tensor], feats: Dict[str, dict],
     frozen: bool,
 ) -> Optional[Dict]:
-    """One carry-ledger day: reconcile (price + funding accrual) vs previous
-    carry_state, then freeze (backfill) or apply the banded update.
-    carry账本单日推进：对账（价格+funding计提）→ 冻结或banding更新。"""
-    row = conn.execute(
-        "SELECT date, mark_ts, long_assets, short_assets, all_closes "
-        "FROM carry_state WHERE date < ? ORDER BY date DESC LIMIT 1", (date,)
-    ).fetchone()
-
-    if row is None:
-        if frozen:
-            return None
-        new_l, new_s = banded_update(sig, [], [], CARRY_K, CARRY_ENTER, CARRY_EXIT)
-        conn.execute(
-            "INSERT OR REPLACE INTO carry_state VALUES (?,?,?,?,?,?)",
-            (date, mark_ts, json.dumps(new_l), json.dumps(new_s),
-             json.dumps(sig), json.dumps(closes)))
-        return {"date": date, "long": new_l, "short": new_s,
-                "slot_changes": 2 * CARRY_K, "first": True}
-
-    prev_date, prev_mark_ts, lj, sj, cj = row
-    prev_long, prev_short = json.loads(lj), json.loads(sj)
-    prev_closes = json.loads(cj)
-    acc = funding_accrual_between(funding, feats, int(prev_mark_ts), mark_ts)
-
-    def leg_ret(assets, sign):
-        rets = []
-        for a in assets:
-            pc, tc = prev_closes.get(a), closes.get(a)
-            if pc and tc and pc > 0:
-                rets.append(sign * (tc / pc - 1.0) - sign * acc.get(a, 0.0))
-        return sum(rets) / len(rets) if rets else 0.0
-
-    long_ret = leg_ret(prev_long, +1.0)   # longs PAY positive funding / 多头付
-    short_ret = leg_ret(prev_short, -1.0)  # shorts RECEIVE it / 空头收
-    port_ret = 0.5 * long_ret + 0.5 * short_ret
-    fund_pnl = (0.5 * (sum(-acc.get(a, 0.0) for a in prev_long) / max(len(prev_long), 1))
-                + 0.5 * (sum(+acc.get(a, 0.0) for a in prev_short) / max(len(prev_short), 1)))
-    n_days = max((datetime.strptime(date, "%Y-%m-%d")
-                  - datetime.strptime(prev_date, "%Y-%m-%d")).days, 1)
-
-    if frozen:
-        new_l, new_s = list(prev_long), list(prev_short)
-        slot_changes = 0
-    else:
-        new_l, new_s = banded_update(sig, prev_long, prev_short,
-                                     CARRY_K, CARRY_ENTER, CARRY_EXIT)
-        slot_changes = (len(set(prev_long) ^ set(new_l))
-                        + len(set(prev_short) ^ set(new_s)))
-    cost_est = slot_changes * (0.5 / CARRY_K) * (EST_COST_BPS / 10000.0)
-
-    cum_cur = conn.execute(
-        "SELECT cumulative_ret FROM carry_pnl WHERE date < ? "
-        "ORDER BY date DESC LIMIT 1", (date,)).fetchone()
-    prev_cum = cum_cur[0] if cum_cur else 0.0
-    cum_ret = (1 + prev_cum) * (1 + port_ret - cost_est) - 1.0
-
-    conn.execute(
-        "INSERT OR REPLACE INTO carry_pnl VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (date, prev_date, n_days,
-         json.dumps(prev_long), json.dumps(prev_short),
-         long_ret, short_ret, port_ret, fund_pnl,
-         slot_changes, cost_est, cum_ret))
-    conn.execute(
-        "INSERT OR REPLACE INTO carry_state VALUES (?,?,?,?,?,?)",
-        (date, mark_ts, json.dumps(new_l), json.dumps(new_s),
-         json.dumps(sig), json.dumps(closes)))
-    return {"date": date, "prev_date": prev_date, "n_days": n_days,
-            "long_ret": long_ret, "short_ret": short_ret, "port_ret": port_ret,
-            "funding_pnl": fund_pnl, "cost_est": cost_est,
-            "cumulative_ret": cum_ret,
-            "long": new_l, "short": new_s, "slot_changes": slot_changes}
+    """Carry-sleeve ledger day (price + funding accrual) — delegates to the
+    shared PortfolioBook. carry账本单日推进——委托共享PortfolioBook。"""
+    return CARRY_BOOK.step(
+        conn, date, sig, closes,
+        k=CARRY_K, enter_band=CARRY_ENTER, exit_band=CARRY_EXIT,
+        frozen=frozen, mark_ts=mark_ts,
+        accrual_fn=lambda prev_ts, cur_ts: funding_accrual_between(
+            funding, feats, int(prev_ts), int(cur_ts)))
 
 
 def combo_step(conn, date: str) -> Optional[Dict]:
@@ -752,6 +578,7 @@ def main():
           + (f", label={ckpt.get('label_horizon')}h" if is_v13 else "") + ")")
     feats = build_features(bars, ckpt, device, funding)
     model = build_model(ckpt, device)
+    model_sleeve = ModelSleeve(ckpt, model)
 
     # ---- Backfill missed days (signals recorded; basket FROZEN) ----
     # ---- 补课：缺失日重算信号入库；篮子持仓冻结，仅补每日PnL ----
@@ -763,7 +590,8 @@ def main():
             print(f"  [backfill {d}] SKIP — insufficient bars around the "
                   f"{MARK_HOUR_UTC:02d}:00 UTC mark")
             continue
-        sc_d, cl_d = score_at_indices(feats, model, seq_len, idx_map)
+        sc_d = model_sleeve.compute_scores(feats, funding, idx_map)
+        cl_d = closes_at(feats, idx_map)
         if not args.dry_run:
             rec = reconcile_legacy(conn, cl_d, d)
             write_signal_row(conn, d, sc_d, cl_d)
@@ -797,7 +625,8 @@ def main():
 
     # ---- Today's signal / 今日信号 ----
     today_idx = {sym: len(feats[sym]["ts"]) - 1 for sym in feats}
-    score_dict, closes = score_at_indices(feats, model, seq_len, today_idx)
+    score_dict = model_sleeve.compute_scores(feats, funding, today_idx)
+    closes = closes_at(feats, today_idx)
     sorted_scores = sorted(score_dict.items(), key=lambda x: x[1], reverse=True)
     long1, short1 = sorted_scores[0][0], sorted_scores[-1][0]
 

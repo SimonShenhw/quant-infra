@@ -17,10 +17,52 @@ DSR 将 SR* 设为 N 次独立试验下的期望最大 Sharpe（修正选择偏�
 """
 from __future__ import annotations
 
+import json
 import math
-from typing import List, Sequence
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Optional, Sequence
 
 EULER_GAMMA: float = 0.5772156649015329
+
+# ---------------------------------------------------------------------------
+# Trial registry: every research configuration ever tried increments the DSR
+# n_trials count. HISTORICAL_BASE covers v1-v13 iteration + pre-registry
+# research (hyperparameter sweeps, factor sets, strategy variants) — a
+# deliberately conservative (high) manual estimate frozen at registry launch.
+# trial 登记表：每个试过的研究配置都会增加 DSR 的 n_trials。
+# HISTORICAL_BASE 为登记表启用前的人工保守估计，启用后不再改动。
+# ---------------------------------------------------------------------------
+
+TRIALS_PATH = Path(__file__).resolve().parent.parent / "trials.json"
+HISTORICAL_BASE: int = 56
+
+
+def _load_trials() -> dict:
+    if TRIALS_PATH.exists():
+        with open(TRIALS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return {"historical_base": HISTORICAL_BASE, "trials": []}
+
+
+def register_trial(name: str, meta: Optional[dict] = None) -> None:
+    """Append a trial (idempotent by name). / 登记一次试验（按名幂等）。"""
+    data = _load_trials()
+    if any(t["name"] == name for t in data["trials"]):
+        return
+    data["trials"].append({
+        "name": name,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "meta": meta or {},
+    })
+    with open(TRIALS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def dsr_n_trials() -> int:
+    """Total trials for DSR: historical base + registered. / DSR 用的总试验数。"""
+    data = _load_trials()
+    return int(data.get("historical_base", HISTORICAL_BASE)) + len(data["trials"])
 
 
 def norm_cdf(x: float) -> float:

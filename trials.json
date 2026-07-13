@@ -1,0 +1,70 @@
+{
+  "historical_base": 56,
+  "trials": [
+    {
+      "name": "research_2026-07-02/A_v13_LS_band",
+      "ts": "2026-07-13T15:18:02Z",
+      "meta": {
+        "kind": "backtest_variant",
+        "doc": "RESEARCH_2026-07-02.md"
+      }
+    },
+    {
+      "name": "research_2026-07-02/A_fund_LS_band_accrual",
+      "ts": "2026-07-13T15:18:02Z",
+      "meta": {
+        "kind": "backtest_variant",
+        "doc": "RESEARCH_2026-07-02.md"
+      }
+    },
+    {
+      "name": "research_2026-07-02/B_long_only_band",
+      "ts": "2026-07-13T15:18:02Z",
+      "meta": {
+        "kind": "backtest_variant",
+        "doc": "RESEARCH_2026-07-02.md"
+      }
+    },
+    {
+      "name": "research_2026-07-02/C_long_band_vs_EW_hedge",
+      "ts": "2026-07-13T15:18:02Z",
+      "meta": {
+        "kind": "backtest_variant",
+        "doc": "RESEARCH_2026-07-02.md"
+      }
+    },
+    {
+      "name": "research_2026-07-02/D_carry_sleeve",
+      "ts": "2026-07-13T15:18:02Z",
+      "meta": {
+        "kind": "backtest_variant",
+        "doc": "RESEARCH_2026-07-02.md"
+      }
+    },
+    {
+      "name": "research_2026-07-02/E_combo_50_50",
+      "ts": "2026-07-13T15:18:02Z",
+      "meta": {
+        "kind": "backtest_variant",
+        "doc": "RESEARCH_2026-07-02.md"
+      }
+    },
+    {
+      "name": "regime_conditioned_ic_2026-07-13",
+      "ts": "2026-07-13T15:19:28Z",
+      "meta": {
+        "kind": "diagnostic",
+        "buckets": [
+          "ALL",
+          "trend200d_up",
+          "trend200d_down",
+          "trend100d_up",
+          "trend100d_down",
+          "vol_low",
+          "vol_mid",
+          "vol_high"
+        ]
+      }
+    }
+  ]
+}

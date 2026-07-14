@@ -192,9 +192,50 @@ def t4_ledger_conservation():
         conn.close()
 
 
+def t5_continuous_book_conservation():
+    """ContinuousBook (O2 sleeve ledger) must match analytic GP values."""
+    from run_paper_daily import init_db
+    from sleeves import ContinuousBook
+    syms = [f"A{i:02d}" for i in range(1, 17)]
+    scores = {s: float(16 - i) for i, s in enumerate(syms)}
+    close1 = {s: 100.0 for s in syms}
+    tau, bps = 0.2, 8.0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = init_db(os.path.join(tmp, "t5.db"))
+        book = ContinuousBook("o2_state", "o2_pnl", cost_bps=bps, tau=tau)
+
+        # day1: GP ramp from zero -> w = tau*target, turnover = tau (gross 1)
+        # 首日从零起步：w=tau*target，换手=tau
+        r1 = book.step(conn, "2026-01-01", scores, close1, 1000, frozen=False)
+        assert r1.get("first")
+        assert abs(r1["turnover"] - tau) < 1e-9
+        assert abs(sum(abs(x) for x in r1["weights"].values()) - tau) < 1e-9
+
+        # day2: flat prices, same scores -> port 0, turnover = tau*(1-tau)
+        # 次日价格持平同打分：收益0，换手=tau(1-tau)
+        r2 = book.step(conn, "2026-01-02", scores, close1, 2000, frozen=False)
+        assert abs(r2["port_ret"]) < 1e-12
+        assert abs(r2["turnover"] - tau * (1 - tau)) < 1e-9
+        expect_cost = tau * (1 - tau) * bps / 10000.0
+        assert abs(r2["cost_est"] - expect_cost) < 1e-12
+        assert abs(r2["cumulative_ret"] - (-expect_cost)) < 1e-12
+
+        # day3 frozen: +1% on every positive-weight asset -> port = sum(w+)*1%
+        # 冻结日：正权重资产+1%
+        w2 = r2["weights"]
+        close3 = {s: (101.0 if w2[s] > 0 else 100.0) for s in syms}
+        r3 = book.step(conn, "2026-01-03", scores, close3, 3000, frozen=True)
+        pos_gross = sum(x for x in w2.values() if x > 0)
+        assert abs(r3["port_ret"] - pos_gross * 0.01) < 1e-12
+        assert r3["turnover"] == 0.0
+        conn.close()
+
+
 def main():
     tests = [t1_timestamp_golden, t2_no_lookahead,
-             t3_checkpoint_fingerprint, t4_ledger_conservation]
+             t3_checkpoint_fingerprint, t4_ledger_conservation,
+             t5_continuous_book_conservation]
     failed = 0
     for fn in tests:
         try:

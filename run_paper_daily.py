@@ -39,7 +39,7 @@ sys.path.insert(0, str(BASE_DIR))
 import factors as _  # trigger auto-discover / 触发自动发现
 from factors.base import FactorRegistry
 from model.cross_asset_attention import CrossAssetGRUAttention
-from sleeves import CarrySleeve, ModelSleeve, PortfolioBook
+from sleeves import CarrySleeve, ContinuousBook, ModelSleeve, PortfolioBook
 from sleeves.banding import banded_update_symbols
 
 DB_PATH: str = str(BASE_DIR / "paper_daily.db")
@@ -133,6 +133,15 @@ def init_db(db_path: str) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS combo_pnl (
             date TEXT PRIMARY KEY, prev_date TEXT,
             model_net REAL, carry_net REAL, combo_ret REAL,
+            cumulative_ret REAL
+        );
+        CREATE TABLE IF NOT EXISTS o2_state (
+            date TEXT PRIMARY KEY, mark_ts INTEGER,
+            weights TEXT, all_scores TEXT, all_closes TEXT
+        );
+        CREATE TABLE IF NOT EXISTS o2_pnl (
+            date TEXT PRIMARY KEY, prev_date TEXT, n_days INTEGER,
+            port_ret REAL, turnover REAL, cost_est REAL,
             cumulative_ret REAL
         );
     """)
@@ -379,6 +388,19 @@ CARRY_BOOK = PortfolioBook("carry", "carry_state", "carry_pnl",
                            cost_bps=EST_COST_BPS)
 
 
+def load_o2_sleeve(device) -> Optional[Tuple]:
+    """v14 O2 sleeve (continuous weights, own 16-symbol universe/factors);
+    active only when its production checkpoint exists.
+    O2 sleeve：有 o2_production.pt 才启用；自带 16 币宇宙与 18 因子。"""
+    path = BASE_DIR / "checkpoints" / "o2_production.pt"
+    if not path.exists():
+        return None
+    ckpt = load_checkpoint(path, device)
+    book = ContinuousBook("o2_state", "o2_pnl", cost_bps=EST_COST_BPS,
+                          tau=float(ckpt.get("construction", {}).get("tau", 0.2)))
+    return ckpt, book
+
+
 # ============================================================================
 # Reconcile + logging (date-keyed upserts)
 # ============================================================================
@@ -580,6 +602,17 @@ def main():
     model = build_model(ckpt, device)
     model_sleeve = ModelSleeve(ckpt, model)
 
+    o2_sleeve = o2_book = o2_feats = None
+    o2_loaded = load_o2_sleeve(device)
+    if o2_loaded:
+        o2_ckpt, o2_book = o2_loaded
+        o2_bars = {s: bars[s] for s in o2_ckpt["symbols"]}
+        o2_feats = build_features(o2_bars, o2_ckpt, device, funding)
+        o2_sleeve = ModelSleeve(o2_ckpt, build_model(o2_ckpt, device))
+        print(f"  Loaded o2_production.pt (v14 sleeve: {o2_ckpt['objective']}, "
+              f"{len(o2_bars)} symbols, {o2_ckpt['n_factors']} factors, "
+              f"tau={o2_book.tau})")
+
     # ---- Backfill missed days (signals recorded; basket FROZEN) ----
     # ---- 补课：缺失日重算信号入库；篮子持仓冻结，仅补每日PnL ----
     print(f"\n[4/5] Review & backfill ({len(missed)} missed day(s)) ...")
@@ -605,6 +638,11 @@ def main():
             cinfo = (carry_step(conn, d, csig_d, cl_d, mark_open_ms, funding,
                                 feats, frozen=True) if csig_d else None)
             combo_step(conn, d)
+            oinfo = None
+            if o2_sleeve:
+                idx2 = {s: idx_map[s] for s in o2_feats}
+                sc2 = o2_sleeve.compute_scores(o2_feats, funding, idx2)
+                oinfo = o2_book.step(conn, d, sc2, cl_d, mark_open_ms, frozen=True)
             conn.commit()
             msg = f"  [backfill {d}] signal logged"
             if rec:
@@ -614,6 +652,8 @@ def main():
                         f"cum {binfo['cumulative_ret']:+.4%}")
             if cinfo and "port_ret" in cinfo:
                 msg += f"; carry(frozen) {cinfo['port_ret']:+.4%}"
+            if oinfo and "port_ret" in oinfo:
+                msg += f"; o2(frozen) {oinfo['port_ret']:+.4%}"
             print(msg)
         else:
             ranked = sorted(sc_d.items(), key=lambda x: x[1], reverse=True)
@@ -633,10 +673,16 @@ def main():
     today_mark_ts = int(min(feats[sym]["ts"][-1] for sym in feats))
     carry_sig = carry_signal_at(funding, feats, today_idx)
 
+    o2_scores = None
+    if o2_sleeve:
+        idx2_today = {s: len(o2_feats[s]["ts"]) - 1 for s in o2_feats}
+        o2_scores = o2_sleeve.compute_scores(o2_feats, funding, idx2_today)
+
     recon = None
     basket_info = None
     carry_info = None
     combo_info = None
+    o2_info = None
     if not args.dry_run:
         recon = reconcile_legacy(conn, closes, today)
         write_signal_row(conn, today, score_dict, closes)
@@ -650,6 +696,9 @@ def main():
         else:
             print("  WARNING: carry signal unavailable (funding degraded) — "
                   "carry ledger skipped today")
+        if o2_scores:
+            o2_info = o2_book.step(conn, today, o2_scores, closes,
+                                   today_mark_ts, frozen=False)
         conn.commit()
     elif is_v13:
         # dry-run preview of the banded update / 干跑时也预览篮子更新
@@ -683,6 +732,21 @@ def main():
     if combo_info:
         print(f"  [combo]  50/50 model+carry: {combo_info['combo_ret']:+.4%}, "
               f"cum {combo_info['cumulative_ret']:+.4%}")
+    if o2_info and "port_ret" in o2_info:
+        print(f"  [o2]     {o2_info['prev_date']} -> {today}: "
+              f"port {o2_info['port_ret']:+.4%} "
+              f"(turnover {o2_info['turnover']:.3f}, "
+              f"cost est {o2_info['cost_est']:.4%}), "
+              f"cum {o2_info['cumulative_ret']:+.4%}")
+    elif o2_info and o2_info.get("first"):
+        print(f"  [o2]     track initialized (GP ramp from zero, "
+              f"turnover {o2_info['turnover']:.3f})")
+    if o2_scores:
+        tw = ContinuousBook.target_weights(o2_scores)
+        top = sorted(tw.items(), key=lambda x: -x[1])
+        print(f"    [o2] top weights: "
+              + ", ".join(f"{s}{w:+.3f}" for s, w in top[:3])
+              + " | " + ", ".join(f"{s}{w:+.3f}" for s, w in top[-3:]))
 
     print("\n  TODAY'S SIGNAL / 今日信号:")
     if basket_info:

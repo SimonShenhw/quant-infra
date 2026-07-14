@@ -107,7 +107,7 @@ IC 在**每一年都为正**（含 2021 狂热、2022 崩盘、2023 震荡），
 - 全部诚实计入 registry（n_trials=77，已合并集群侧登记）。
 
 ### v14 骨架（最终）
-**carry sleeve + O2 模型 sleeve（pairwise magnitude-weighted ranking）**，装进 Phase 1 的 Sleeve/PortfolioBook 框架。v13 paper track 照跑到 9 月 gate（预注册证据不中断）；下一步：O2 生产模型全量重训 → 开第三条 paper track 并行检验。
+**carry sleeve + O2 模型 sleeve（pairwise magnitude-weighted ranking）**，装进 Phase 1 的 Sleeve/PortfolioBook 框架。v13 paper track 照跑到 9 月 gate（预注册证据不中断）；O2 生产模型已全量重训（H200，val_corr(z)=0.027）并于 **2026-07-14 作为第三条 paper track 上线**（`o2_state`/`o2_pnl` 表，ContinuousBook：连续权重 + GP τ=0.2 渐进建仓，16 币 18 因子自带宇宙）。三本 live 账并行至 9 月 gate。
 
 ## 附注
 - 9 月中 gate 判据不变（预注册不改）；本研究只改变 v14 的**方案候选**，不改变裁决标准。

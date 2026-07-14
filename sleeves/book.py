@@ -166,3 +166,96 @@ class PortfolioBook:
         if self.layout == "carry":
             out["funding_pnl"] = funding_pnl
         return out
+
+
+class ContinuousBook:
+    """
+    Ledger for continuous-weight sleeves (v14 O2 model: demeaned-score
+    weights, Garleanu-Pedersen partial trading w_t = (1-tau)w + tau*target).
+    连续权重账本（O2 sleeve：打分去均值权重 + GP 部分调仓）。
+
+    Tables (created by the caller's init_db):
+      {state}: date PK, mark_ts, weights(json sym->w), all_scores, all_closes
+      {pnl}:   date PK, prev_date, n_days, port_ret, turnover, cost_est, cum
+    Semantics: frozen=True keeps weights (missed-day backfill); the first
+    live day moves tau from zero (GP ramp, matching the gated backtest).
+    """
+
+    def __init__(self, state_table: str, pnl_table: str,
+                 cost_bps: float = 8.0, tau: float = 0.2) -> None:
+        self.state_table = state_table
+        self.pnl_table = pnl_table
+        self.cost_bps = cost_bps
+        self.tau = tau
+
+    @staticmethod
+    def target_weights(scores: Dict[str, float]) -> Dict[str, float]:
+        syms = sorted(scores)
+        v = [scores[s] for s in syms]
+        m = sum(v) / len(v)
+        raw = {s: scores[s] - m for s in syms}
+        g = sum(abs(x) for x in raw.values())
+        if g < 1e-12:
+            return {s: 0.0 for s in syms}
+        return {s: x / g for s, x in raw.items()}
+
+    def step(self, conn, date: str, scores: Dict[str, float],
+             closes: Dict[str, float], mark_ts: Optional[int],
+             frozen: bool) -> Optional[Dict]:
+        prev = conn.execute(
+            f"SELECT date, weights, all_closes FROM {self.state_table} "
+            f"WHERE date < ? ORDER BY date DESC LIMIT 1", (date,)).fetchone()
+
+        if prev is None:
+            if frozen:
+                return None
+            target = self.target_weights(scores)
+            w = {s: self.tau * x for s, x in target.items()}  # GP ramp from zero
+            turnover = sum(abs(x) for x in w.values())
+            cost_est = turnover * self.cost_bps / 10000.0
+            conn.execute(
+                f"INSERT OR REPLACE INTO {self.state_table} VALUES (?,?,?,?,?)",
+                (date, mark_ts, json.dumps(w), json.dumps(scores),
+                 json.dumps(closes)))
+            return {"date": date, "weights": w, "turnover": turnover,
+                    "cost_est": cost_est, "first": True}
+
+        prev_date, wj, cj = prev
+        w_prev = json.loads(wj)
+        prev_closes = json.loads(cj)
+
+        port_ret = 0.0
+        for s, wi in w_prev.items():
+            pc, tc = prev_closes.get(s), closes.get(s)
+            if pc and tc and pc > 0:
+                port_ret += wi * (tc / pc - 1.0)
+
+        if frozen:
+            w_new = dict(w_prev)
+            turnover = 0.0
+        else:
+            target = self.target_weights(scores)
+            w_new = {s: (1 - self.tau) * w_prev.get(s, 0.0) + self.tau * target[s]
+                     for s in target}
+            turnover = sum(abs(w_new[s] - w_prev.get(s, 0.0)) for s in w_new)
+        cost_est = turnover * self.cost_bps / 10000.0
+        n_days = max((datetime.strptime(date, "%Y-%m-%d")
+                      - datetime.strptime(prev_date, "%Y-%m-%d")).days, 1)
+
+        cum_cur = conn.execute(
+            f"SELECT cumulative_ret FROM {self.pnl_table} WHERE date < ? "
+            f"ORDER BY date DESC LIMIT 1", (date,)).fetchone()
+        prev_cum = cum_cur[0] if cum_cur else 0.0
+        cum_ret = (1 + prev_cum) * (1 + port_ret - cost_est) - 1.0
+
+        conn.execute(
+            f"INSERT OR REPLACE INTO {self.pnl_table} VALUES (?,?,?,?,?,?,?)",
+            (date, prev_date, n_days, port_ret, turnover, cost_est, cum_ret))
+        conn.execute(
+            f"INSERT OR REPLACE INTO {self.state_table} VALUES (?,?,?,?,?)",
+            (date, mark_ts, json.dumps(w_new), json.dumps(scores),
+             json.dumps(closes)))
+        return {"date": date, "prev_date": prev_date, "n_days": n_days,
+                "port_ret": port_ret, "turnover": turnover,
+                "cost_est": cost_est, "cumulative_ret": cum_ret,
+                "weights": w_new}

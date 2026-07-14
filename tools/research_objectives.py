@@ -89,7 +89,31 @@ class SoftPortfolio(nn.Module):
         return -(w * z).sum(-1).mean()
 
 
-OBJECTIVES = {"O1": VolnormMSE, "O2": PairMagWeighted, "O3": SoftPortfolio}
+class O2O3Combined(nn.Module):
+    """Ablation (pre-registered follow-up to the O2/O3 double-PASS):
+    L = O3_softport + lam * O2_pairwise. Raw loss scales differ ~45x
+    (O3 ~0.02, O2 ~0.9), so lam in {0.01, 0.03, 0.1} spans
+    O3-dominant -> balanced -> O2-dominant.
+    SELECTION RULE (pre-registered): among gate-passers, pick highest
+    n_pos_years, tie-break by backtest Sharpe.
+    O2/O3 混合消融；λ 已按损失量级差校准；选择规则预注册。"""
+
+    def __init__(self, lam: float) -> None:
+        super().__init__()
+        self.lam = lam
+        self.o2 = PairMagWeighted()
+        self.o3 = SoftPortfolio()
+
+    def forward(self, scores: Tensor, z: Tensor) -> Tensor:
+        return self.o3(scores, z) + self.lam * self.o2(scores, z)
+
+
+OBJECTIVES = {
+    "O1": VolnormMSE, "O2": PairMagWeighted, "O3": SoftPortfolio,
+    "M001": lambda: O2O3Combined(0.01),
+    "M003": lambda: O2O3Combined(0.03),
+    "M010": lambda: O2O3Combined(0.10),
+}
 
 
 # ---------------------------------------------------------------------------

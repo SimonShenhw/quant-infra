@@ -52,7 +52,8 @@ SYMBOLS: List[str] = [
 ]
 
 N_BARS_BASE: int = 250       # warmup: 48-bar z-score + EMAs converge well before seq tail / 暖机
-N_BARS_MAX: int = 950        # exchange fetch cap / 交易所单次拉取上限内
+N_BARS_MAX: int = 950        # gate/bybit honor up to 1000; okx caps at 300 (see fetch_bars)
+                             # gate/bybit 支持约1000根；okx 静默截断300（见 fetch_bars）
 MARK_HOUR_UTC: int = 23      # daily mark = close of the 22:00-23:00 UTC bar (~19:00 US Eastern,
                              # matches the 19:30 local scheduled run) / 每日记账时点，对齐本地19:30运行
 MAX_BACKFILL_DAYS: int = 28  # beyond this, declare a break instead of backfilling / 超过则视为断档
@@ -74,6 +75,36 @@ DROP_FACTORS_FALLBACK = {"volume_zscore", "volume_momentum", "macd", "klow"}
 
 def utc_today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def ckpt_sha(path: Path) -> str:
+    """Short sha256 of a checkpoint file — recorded per run so silent ckpt
+    replacements show up as a dated regime change in run_meta (G5).
+    ckpt 文件短哈希：入账后静默换模型会在 run_meta 留下带日期的痕迹。"""
+    import hashlib
+    if not path.exists():
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:8]
+
+
+def backup_db(db_path: str, keep: int = 10) -> None:
+    """Rotate daily DB backups — the ledgers are the September evidence.
+    每日备份轮转：账本即九月裁决证据。"""
+    import shutil
+    src = Path(db_path)
+    if not src.exists():
+        return
+    bdir = src.parent / "backups"
+    bdir.mkdir(exist_ok=True)
+    dst = bdir / f"paper_daily_{utc_today()}.db"
+    shutil.copy2(src, dst)
+    baks = sorted(bdir.glob("paper_daily_*.db"))
+    for old in baks[:-keep]:
+        old.unlink()
 
 
 def date_range_exclusive(d0: str, d1: str) -> List[str]:
@@ -144,6 +175,12 @@ def init_db(db_path: str) -> sqlite3.Connection:
             port_ret REAL, turnover REAL, cost_est REAL,
             cumulative_ret REAL
         );
+        CREATE TABLE IF NOT EXISTS run_meta (
+            date TEXT PRIMARY KEY, run_utc TEXT,
+            funding_degraded TEXT,
+            v13_ckpt_sha TEXT, o2_ckpt_sha TEXT,
+            notes TEXT
+        );
     """)
     try:
         conn.execute("ALTER TABLE daily_signals ADD COLUMN all_closes TEXT")
@@ -194,7 +231,11 @@ def fetch_bars(symbols: List[str], n_bars: int) -> Dict[str, List[Tuple]]:
             try:
                 ohlcv = ex.fetch_ohlcv(sym, "1h", limit=n_bars)
                 ohlcv = _drop_unclosed(ohlcv or [])
-                if len(ohlcv) >= 100:
+                # okx silently caps limit at 300 (F4): require ~full depth so
+                # deep-gap backfills fall through to bybit/gate (limit 1000).
+                # okx 静默截断到300根：要求接近满额，深补课自动落到下一所。
+                need = max(100, int(min(n_bars, 950) * 0.9))
+                if len(ohlcv) >= need:
                     clean = sym.replace("/", "")
                     result[clean] = [(k[0], k[1], k[2], k[3], k[4], k[5]) for k in ohlcv]
                     got += 1
@@ -571,8 +612,14 @@ def main():
     conn = init_db(args.db)
     today = utc_today()
 
+    run_errors: List[str] = []
+
     # gap detection BEFORE fetch so we pull enough history / 先测断档再定拉取量
     last_date = last_recorded_date(conn)
+    if last_date and today < last_date:
+        # clock skew would silently overwrite mid-series evidence rows (G4)
+        # 时钟回拨会静默覆盖证据链中段——直接拒跑
+        raise SystemExit(f"CLOCK SKEW: today {today} < last recorded {last_date}")
     missed: List[str] = date_range_exclusive(last_date, today) if last_date else []
     if len(missed) > MAX_BACKFILL_DAYS:
         print(f"  WARNING: {len(missed)} missed days > {MAX_BACKFILL_DAYS} cap — "
@@ -602,16 +649,42 @@ def main():
     model = build_model(ckpt, device)
     model_sleeve = ModelSleeve(ckpt, model)
 
+    # today-mark freshness: a stalled feed (delisting precursor) must not
+    # silently enter the cross-section as a stale close (G3)
+    # 当日mark新鲜度：停牌/停推的陈旧收盘价不得静默进入横截面
+    last_ts = {sym: int(feats[sym]["ts"][-1]) for sym in feats}
+    max_ts = max(last_ts.values())
+    stale = {s: round((max_ts - t) / 3_600_000, 1)
+             for s, t in last_ts.items() if max_ts - t > 2 * 3_600_000}
+    if stale:
+        raise RuntimeError(f"STALE last bars (hours behind): {stale} — "
+                           f"refusing to build a misaligned cross-section (G3)")
+
+    # funding degradation is recorded per run so September analysis can
+    # identify degraded-signal days (G2)
+    # funding退化落库：九月分析可甄别退化信号日
+    funding_degraded = sorted(
+        s.replace("/", "") for s in SYMBOLS
+        if funding.get(s.replace("/", "")) is None
+        or bool((funding[s.replace("/", "")] == 0).all()))
+    if funding_degraded:
+        print(f"  NOTE: funding degraded to zeros for {funding_degraded}")
+
     o2_sleeve = o2_book = o2_feats = None
-    o2_loaded = load_o2_sleeve(device)
-    if o2_loaded:
-        o2_ckpt, o2_book = o2_loaded
-        o2_bars = {s: bars[s] for s in o2_ckpt["symbols"]}
-        o2_feats = build_features(o2_bars, o2_ckpt, device, funding)
-        o2_sleeve = ModelSleeve(o2_ckpt, build_model(o2_ckpt, device))
-        print(f"  Loaded o2_production.pt (v14 sleeve: {o2_ckpt['objective']}, "
-              f"{len(o2_bars)} symbols, {o2_ckpt['n_factors']} factors, "
-              f"tau={o2_book.tau})")
+    try:
+        o2_loaded = load_o2_sleeve(device)
+        if o2_loaded:
+            o2_ckpt, o2_book = o2_loaded
+            o2_bars = {s: bars[s] for s in o2_ckpt["symbols"]}
+            o2_feats = build_features(o2_bars, o2_ckpt, device, funding)
+            o2_sleeve = ModelSleeve(o2_ckpt, build_model(o2_ckpt, device))
+            print(f"  Loaded o2_production.pt (v14 sleeve: {o2_ckpt['objective']}, "
+                  f"{len(o2_bars)} symbols, {o2_ckpt['n_factors']} factors, "
+                  f"tau={o2_book.tau})")
+    except Exception as e:  # O2 failure must not kill v13/carry / O2失败不连坐
+        o2_sleeve = None
+        run_errors.append(f"o2 load: {e!r}")
+        print(f"  ERROR: o2 sleeve disabled this run: {e!r}")
 
     # ---- Backfill missed days (signals recorded; basket FROZEN) ----
     # ---- 补课：缺失日重算信号入库；篮子持仓冻结，仅补每日PnL ----
@@ -628,21 +701,34 @@ def main():
         if not args.dry_run:
             rec = reconcile_legacy(conn, cl_d, d)
             write_signal_row(conn, d, sc_d, cl_d)
-            binfo = basket_step(conn, d, sc_d, cl_d, ckpt, ckpt_path.name,
-                                frozen=True) if is_v13 else None
-            # carry ledger: positions frozen on missed days too / carry补课同样冻结
+            binfo = cinfo = oinfo = None
             mark_open_ms = int(datetime.strptime(d, "%Y-%m-%d")
                                .replace(tzinfo=timezone.utc, hour=MARK_HOUR_UTC - 1)
                                .timestamp() * 1000)
-            csig_d = carry_signal_at(funding, feats, idx_map)
-            cinfo = (carry_step(conn, d, csig_d, cl_d, mark_open_ms, funding,
-                                feats, frozen=True) if csig_d else None)
-            combo_step(conn, d)
-            oinfo = None
-            if o2_sleeve:
-                idx2 = {s: idx_map[s] for s in o2_feats}
-                sc2 = o2_sleeve.compute_scores(o2_feats, funding, idx2)
-                oinfo = o2_book.step(conn, d, sc2, cl_d, mark_open_ms, frozen=True)
+            # each ledger isolated: one failing must not lose the others' day
+            # 账本间故障隔离：一本失败不连坐
+            try:
+                if is_v13:
+                    binfo = basket_step(conn, d, sc_d, cl_d, ckpt,
+                                        ckpt_path.name, frozen=True)
+            except Exception as e:
+                run_errors.append(f"backfill {d} basket: {e!r}")
+            try:
+                csig_d = carry_signal_at(funding, feats, idx_map)
+                if csig_d:
+                    cinfo = carry_step(conn, d, csig_d, cl_d, mark_open_ms,
+                                       funding, feats, frozen=True)
+                combo_step(conn, d)
+            except Exception as e:
+                run_errors.append(f"backfill {d} carry/combo: {e!r}")
+            try:
+                if o2_sleeve:
+                    idx2 = {s: idx_map[s] for s in o2_feats}
+                    sc2 = o2_sleeve.compute_scores(o2_feats, funding, idx2)
+                    oinfo = o2_book.step(conn, d, sc2, cl_d, mark_open_ms,
+                                         frozen=True)
+            except Exception as e:
+                run_errors.append(f"backfill {d} o2: {e!r}")
             conn.commit()
             msg = f"  [backfill {d}] signal logged"
             if rec:
@@ -686,19 +772,37 @@ def main():
     if not args.dry_run:
         recon = reconcile_legacy(conn, closes, today)
         write_signal_row(conn, today, score_dict, closes)
-        if is_v13:
-            basket_info = basket_step(conn, today, score_dict, closes,
-                                      ckpt, ckpt_path.name, frozen=False)
-        if carry_sig:
-            carry_info = carry_step(conn, today, carry_sig, closes,
-                                    today_mark_ts, funding, feats, frozen=False)
-            combo_info = combo_step(conn, today)
-        else:
-            print("  WARNING: carry signal unavailable (funding degraded) — "
-                  "carry ledger skipped today")
-        if o2_scores:
-            o2_info = o2_book.step(conn, today, o2_scores, closes,
-                                   today_mark_ts, frozen=False)
+        try:
+            if is_v13:
+                basket_info = basket_step(conn, today, score_dict, closes,
+                                          ckpt, ckpt_path.name, frozen=False)
+        except Exception as e:
+            run_errors.append(f"today basket: {e!r}")
+        try:
+            if carry_sig:
+                carry_info = carry_step(conn, today, carry_sig, closes,
+                                        today_mark_ts, funding, feats,
+                                        frozen=False)
+                combo_info = combo_step(conn, today)
+            else:
+                print("  WARNING: carry signal unavailable (funding degraded) "
+                      "— carry ledger skipped today")
+                run_errors.append("today carry: signal unavailable")
+        except Exception as e:
+            run_errors.append(f"today carry/combo: {e!r}")
+        try:
+            if o2_scores:
+                o2_info = o2_book.step(conn, today, o2_scores, closes,
+                                       today_mark_ts, frozen=False)
+        except Exception as e:
+            run_errors.append(f"today o2: {e!r}")
+        conn.execute(
+            "INSERT OR REPLACE INTO run_meta VALUES (?,?,?,?,?,?)",
+            (today, now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+             json.dumps(funding_degraded),
+             ckpt_sha(ckpt_path),
+             ckpt_sha(BASE_DIR / "checkpoints" / "o2_production.pt"),
+             "; ".join(run_errors)))
         conn.commit()
     elif is_v13:
         # dry-run preview of the banded update / 干跑时也预览篮子更新
@@ -778,8 +882,18 @@ def main():
         print(f"    {i+1:2d}. {sym:12s} {sc:+.4f}{tag}")
 
     conn.close()
+    if not args.dry_run:
+        backup_db(args.db)
     print(f"\n[5/5] {'DRY RUN — nothing written' if args.dry_run else f'Logged to {args.db}'}"
           + (f' (backfilled {n_backfilled} day(s))' if n_backfilled else ''))
+    if run_errors:
+        # partial success: healthy ledgers are committed, but exit nonzero so
+        # the scheduler wrapper raises the Desktop sentinel (F1 alert chain)
+        # 部分成功：健康账本已入库，但以非零码退出触发桌面哨兵
+        print("[DONE WITH ERRORS]")
+        for e in run_errors:
+            print(f"  ERROR: {e}")
+        sys.exit(1)
     print("[DONE]")
 
 

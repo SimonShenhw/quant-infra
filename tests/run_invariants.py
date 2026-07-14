@@ -232,10 +232,55 @@ def t5_continuous_book_conservation():
         conn.close()
 
 
+def t6_orchestration_upsert_and_chain():
+    """Same-day rerun idempotence, multi-day gaps, and cumulative-chain
+    telescoping — the evidence-integrity semantics the September gate
+    depends on. 同日重跑幂等、跨日gap、复利链守恒。"""
+    from run_paper_daily import init_db, basket_step
+    syms = [f"A{i:02d}" for i in range(1, 21)]
+    ckpt = {"basket_k": 3, "enter_band": 3, "exit_band": 6}
+    scores = {s: float(20 - i) for i, s in enumerate(syms)}
+
+    def closes(mult_long):
+        c = {s: 100.0 for s in syms}
+        for s in ("A01", "A02", "A03"):
+            c[s] = 100.0 * mult_long
+        return c
+
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = init_db(os.path.join(tmp, "t6.db"))
+        basket_step(conn, "2026-01-01", scores, closes(1.00), ckpt, "t", False)
+
+        # late run writes day2 with +1%, then same-day rerun revises to +3%:
+        # must UPSERT (single row), recomputed from day1 closes / 同日重跑幂等
+        basket_step(conn, "2026-01-02", scores, closes(1.01), ckpt, "t", False)
+        r2 = basket_step(conn, "2026-01-02", scores, closes(1.03), ckpt, "t", False)
+        n_rows = conn.execute(
+            "SELECT COUNT(*) FROM basket_pnl WHERE date='2026-01-02'").fetchone()[0]
+        assert n_rows == 1, "same-day rerun duplicated the pnl row"
+        assert abs(r2["long_ret"] - 0.03) < 1e-9, "rerun did not recompute from day1"
+
+        # 3-day gap: n_days recorded, chain compounds once / 跨日gap单次复利
+        r5 = basket_step(conn, "2026-01-05", scores, closes(1.03 * 1.02),
+                         ckpt, "t", False)
+        assert r5["n_days"] == 3
+        assert abs(r5["long_ret"] - 0.02) < 1e-9
+
+        # telescoping: stored cum == product of stored nets / 复利链守恒
+        rows = conn.execute(
+            "SELECT port_ret, cost_est, cumulative_ret FROM basket_pnl "
+            "ORDER BY date").fetchall()
+        acc = 1.0
+        for port, cost, cum in rows:
+            acc *= (1 + port - cost)
+            assert abs(cum - (acc - 1)) < 1e-9, "cumulative chain broken"
+        conn.close()
+
+
 def main():
     tests = [t1_timestamp_golden, t2_no_lookahead,
              t3_checkpoint_fingerprint, t4_ledger_conservation,
-             t5_continuous_book_conservation]
+             t5_continuous_book_conservation, t6_orchestration_upsert_and_chain]
     failed = 0
     for fn in tests:
         try:

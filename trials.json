@@ -131,6 +131,54 @@
         "kind": "construction",
         "cost_bps": 8.0
       }
+    },
+    {
+      "name": "objectives_2026-07-13/O1",
+      "ts": "2026-07-13T18:42:34Z",
+      "meta": {
+        "kind": "training_objective",
+        "gate_pass": false
+      }
+    },
+    {
+      "name": "objectives_2026-07-13/O3",
+      "ts": "2026-07-13T18:43:42Z",
+      "meta": {
+        "kind": "training_objective",
+        "gate_pass": true
+      }
+    },
+    {
+      "name": "objectives_2026-07-13/O2",
+      "ts": "2026-07-13T18:44:40Z",
+      "meta": {
+        "kind": "training_objective",
+        "gate_pass": true
+      }
+    },
+    {
+      "name": "objectives_2026-07-13/M010",
+      "ts": "2026-07-14T12:02:51Z",
+      "meta": {
+        "kind": "training_objective",
+        "gate_pass": true
+      }
+    },
+    {
+      "name": "objectives_2026-07-13/M001",
+      "ts": "2026-07-14T12:16:53Z",
+      "meta": {
+        "kind": "training_objective",
+        "gate_pass": true
+      }
+    },
+    {
+      "name": "objectives_2026-07-13/M003",
+      "ts": "2026-07-14T12:19:49Z",
+      "meta": {
+        "kind": "training_objective",
+        "gate_pass": true
+      }
     }
   ]
 }

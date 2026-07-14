@@ -92,8 +92,22 @@ IC 在**每一年都为正**（含 2021 狂热、2022 崩盘、2023 震荡），
 - 零调参单次运行（有利于可信度）；trial +3（registry ~77）；PSR 0.62~0.81 仍非 DSR 意义显著。
 - O3 在 2025-2026 为负（与 ListMLE 恰好互补——它只在 2025 赚钱）；O2 最稳（5/6 年，含 2026）。两者的组合/消融是 v14 模型侧的下一个（也是唯一批准的）实验。
 
-### v14 骨架（据此确定）
-**carry sleeve + magnitude-aware 模型 sleeve（O3 为主候选、O2 为一致性候选）**，装进 Phase 1 的 Sleeve/PortfolioBook 框架。v13 paper track 照跑到 9 月 gate（预注册证据不中断）；v14 候选模型可另开第三条 paper track 并行检验。
+### 消融裁定（O2/O3 混合，λ∈{0.01,0.03,0.1}，gpu-short/sharing 分区）
+
+| 变体 | w·y24 | 正年份 | 回测（8bps, τ=1/5） | gate |
+|---|---|---|---|---|
+| M001（O3 主导） | +9.9bp/d | 4/6 | +10.2%, Sharpe 0.21 | PASS |
+| M003（均衡） | +10.9bp/d | 4/6 | +33.1%, Sharpe 0.50 | PASS |
+| M010（O2 主导） | **+14.8bp/d** | 4/6 | **+64.7%, Sharpe 0.75, PSR 0.96** | PASS |
+| O2（endpoint，前日） | +6.0bp/d | **5/6** | +4.6%, Sharpe 0.14 | PASS |
+| O3（endpoint，前日） | +10.2bp/d | 4/6 | +26.4%, Sharpe 0.39 | PASS |
+
+- λ 扫描单调指向 O2 方向（Sharpe 随 O2 权重上升），家族行为连贯、非刀锋敏感。
+- **按预注册选择规则（正年份数优先、Sharpe 破平），v14 模型 sleeve = O2**（5/6 年为正，且是唯一在 2026 为正的变体，+10.8bp/d）。M010 的 Sharpe 0.75 高度前置于 2021-22（+56/+19bp），2026 为 **-13bp**——对 2026 年部署而言，"到处都小赚"胜过"五年前大赚"。M010 记档为备选。
+- 全部诚实计入 registry（n_trials=77，已合并集群侧登记）。
+
+### v14 骨架（最终）
+**carry sleeve + O2 模型 sleeve（pairwise magnitude-weighted ranking）**，装进 Phase 1 的 Sleeve/PortfolioBook 框架。v13 paper track 照跑到 9 月 gate（预注册证据不中断）；下一步：O2 生产模型全量重训 → 开第三条 paper track 并行检验。
 
 ## 附注
 - 9 月中 gate 判据不变（预注册不改）；本研究只改变 v14 的**方案候选**，不改变裁决标准。

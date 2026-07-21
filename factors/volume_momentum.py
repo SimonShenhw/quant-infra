@@ -1,12 +1,27 @@
 """
 Volume Momentum Factor — 成交量动量因子。
 
-Measures short-term volume acceleration: ratio of recent volume to
-longer-term average. Spikes indicate institutional activity or
-panic — both are predictive of short-term reversal.
+WHAT: short-term volume acceleration — SMA(volume, 6h) / SMA(volume, 48h) - 1.
+WHAT：短期成交量加速度——SMA(6h) / SMA(48h) - 1。
 
-衡量短期成交量加速度：近期成交量与长期均值的比率。
-尖峰表明机构活动或恐慌——两者都能预测短期反转。
+HYPOTHESIS: participation shift. A rising short/long volume ratio means
+the market is suddenly more crowded than its own recent baseline —
+institutional entry or panic — and such spikes tend to precede short-term
+reversal or regime change. Using two SMAs (not raw volume) makes the
+signal self-normalizing across assets with wildly different base turnover.
+经济假设：参与度迁移。短/长量比抬升意味着市场突然比自身近期基线更拥挤——
+机构进场或恐慌——这类尖峰倾向预示短期反转或状态切换。用两条 SMA 而非
+原始量，使信号在基础换手率相差悬殊的资产间自归一。
+
+Track record — BORDERLINE, stated honestly: v11.1/v12's IC ranking
+(computed on data later shown to be corrupted by the ms/µs timestamp bug)
+dropped it as noise (|IC_1h| < 0.003). The 2026-06-10 true-1h rerank did
+NOT confirm that verdict — it survives in v13's 19-factor set (only macd
+and volume_zscore remain dropped). Treat it as weak but not dead.
+战绩——边缘因子，如实交代：v11.1/v12 的 IC 排名（后来证实基于 ms/µs 时间戳
+bug 污染的数据）把它当噪声剔除（|IC_1h| < 0.003）；2026-06-10 真 1h 重排
+未确认该判决——它保留在 v13 的 19 因子集中（DROP 名单只剩 macd 与
+volume_zscore）。定位：弱，但没死。
 """
 from factors.base import BaseFactor, register_factor
 from model.features import compute_sma

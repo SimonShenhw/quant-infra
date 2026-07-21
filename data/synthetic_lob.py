@@ -11,6 +11,23 @@ Generates market data with learnable microstructure patterns:
 These patterns are subtle enough that a Transformer should be able
 to learn them, but not trivially exploitable — mimicking real markets.
 
+WHY synthetic data with PLANTED patterns: it turns "can the model learn?"
+into a falsifiable test. On real data, failure to find signal is ambiguous
+(no signal? bug? leakage?); here the ground-truth patterns are known, so a
+model that cannot recover them indicts the pipeline, not the market. The
+seeded generator also gives deterministic fixtures for engine/execution
+tests without shipping real data.
+为什么用"埋了已知模式"的合成数据：它把"模型能不能学"变成可证伪的测试。
+真实数据上找不到信号是含糊的（没信号？有 bug？泄露了？）；这里真值模式已知，
+模型学不出来即可定罪于管线而非市场。带种子的生成器还为引擎/执行测试提供
+确定性夹具，无需携带真实数据。
+
+STATUS — honest scope note: consumed only by main.py (the single-asset
+synthetic demo, the project's v1-era entry point). Not part of the v13+
+result path, which trains exclusively on real Binance archive data.
+状态——如实说明：仅被 main.py（单资产合成数据演示、项目 v1 时期入口）使用。
+不在 v13+ 结果路径内——那条路径只用真实 Binance 归档数据训练。
+
 合成LOB（限价订单簿）逐笔数据生成器（v2）。
 
 生成包含可学习微观结构模式的行情数据：

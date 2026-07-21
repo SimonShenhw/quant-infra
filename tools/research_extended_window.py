@@ -2,8 +2,14 @@
 Extended-window retrain: does the cross-sectional alpha survive 2021-2026?
 扩窗重训：横截面 alpha 能否穿越完整周期？(ROADMAP Phase 2.1)
 
-Two runs on the SAME 16-symbol universe (full 2021+ Binance history;
-APT/ARB/OP/SUI excluded — listed later) and the SAME 18 factors
+HYPOTHESIS: v13's 19-month window (2024-09..2026-03) contains no sustained
+alt-rally regime; the regime-IC study (research_regime_ic.py) acquitted the
+short leg IN-window, so the remaining suspect is that the window itself is
+unrepresentative. Retraining on 2021+ (bull mania, crash, chop, full cycle)
+is the direct test — prioritized over any model change.
+
+METHOD: two runs on the SAME 16-symbol universe (full 2021+ Binance
+history; APT/ARB/OP/SUI excluded — listed later) and the SAME 18 factors
 (funding_rate excluded: funding_rates.db only covers 2024-09+, keeping it
 would split one input channel's semantics across the window):
 
@@ -16,6 +22,30 @@ Per run: CPCV (6,2) with purge 48 / embargo 48, 24h label, turnover-penalty
 loss — the v13 recipe. Reports OOS rank IC overall / per year / per BTC-trend
 regime, leg alphas, and the banded top-3 backtest. Fold ckpts go to
 checkpoints/folds_ext_{full,ctrl} (folds_v13 untouched). Registers 2 trials.
+
+VERDICT (2026-07-13, RESEARCH_2026-07-13_extended_window.md): the RANKING
+signal is real and cycle-robust — CPCV 15/15 folds positive, OOS rank IC
++0.076, and positive in EVERY year 2021-2026 (0.041..0.092) and in both
+trend regimes. But TAIL MONETIZATION FAILS: the same banded-top3 recipe
+loses -64.3% (Sharpe -0.40, maxDD 75%) over the full cycle, and the CTRL
+run is the sharpest evidence — same window as v13, merely dropping the 4
+late-listed high-vol alts (APT/ARB/OP/SUI) + the funding factor flips
++32.6% to -13.6%: v13's headline profit was concentrated in tail trades on
+those four names, a more concrete fragility than DSR 0.11. Final ruling on
+the bear-artifact hypothesis: innocent at the IC level, guilty at the tail
+level — tail shorts bleed systematically in mania years (2021 short alpha
+-0.149%/24h), a historical rehearsal of the June-2026 live losses. Leads
+directly to research_rank_weighted.py (can non-tail constructions monetize
+the mid-book ranking?).
+
+结论：排名信号是真的且穿越全周期——15/15 折为正，OOS IC +0.076，2021-26
+每一年都为正；但尾部变现失败：同配方全周期 banded top3 -64.3%，且 CTRL
+是最锋利的证据——同一窗口只去掉 4 个晚上市高波动山寨（APT/ARB/OP/SUI）
+和 funding 因子，+32.6% 即翻 -13.6%，v13 的账面利润高度集中在那 4 个币的
+尾部交易上（比 DSR 0.11 更具体的脆弱性）。熊市伪影假设终审：IC 层面无罪、
+尾部层面成立——狂热年份尾部做空系统性亏损（2021 空腿 -0.149%/24h），正是
+live 2026-06 亏损模式的历史彩排。下一步：research_rank_weighted.py 检验
+非尾部构建能否变现中段排序。
 """
 from __future__ import annotations
 
@@ -49,7 +79,15 @@ from tools.validation_stats import register_trial
 import factors  # noqa: F401
 
 SEQ_LEN = 24
-EXT_SYMBOLS = [  # full 2021+ history on Binance spot / 2021起全历史
+# Fixed 16-symbol universe with full 2021+ Binance spot history. WHY fixed
+# (no APT/ARB/OP/SUI): a dynamic universe would confound "window effect"
+# with "listing effect", and the model's positional asset embedding cannot
+# absorb mid-sample universe changes anyway. Dropping exactly these 4 is
+# also what turns CTRL into the tail-concentration control experiment.
+# 固定 16 币宇宙（2021 起全历史）。不含 APT/ARB/OP/SUI：动态宇宙会把窗口
+# 效应与上市效应混在一起，且位置式资产嵌入不允许中途换宇宙；恰好也让
+# CTRL 成为"利润是否集中在这 4 个币"的对照实验。
+EXT_SYMBOLS = [
     "AAVEUSDT", "ADAUSDT", "ATOMUSDT", "AVAXUSDT", "BNBUSDT", "BTCUSDT",
     "DOGEUSDT", "DOTUSDT", "ETHUSDT", "INJUSDT", "LINKUSDT", "LTCUSDT",
     "NEARUSDT", "SOLUSDT", "UNIUSDT", "XRPUSDT",

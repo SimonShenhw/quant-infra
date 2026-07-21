@@ -1,3 +1,14 @@
+# ============================================================================
+# HISTORICAL ARTIFACT / 历史存档 - legacy websocket feed
+# Kept as project record. Results produced before the C-1 ms->us timestamp
+# fix (2026-06-10) are unreliable as published; the current pipeline is
+# run_v13_final.py (research) + run_paper_daily.py (live).
+# See REVIEW_2026-06-10.md for the full audit trail.
+# 保留作为项目演进记录；C-1 时间戳修复(2026-06-10)之前产出的结果不可作为
+# 依据；当前管线见 run_v13_final.py 与 run_paper_daily.py。
+# EXTRA (REVIEW L-5): the n_bars parameter is ignored (fetches 1 bar per
+# symbol); unused by any current pipeline. 额外(L-5)：n_bars 形同虚设，无人调用。
+# ============================================================================
 """
 Realtime market data feed via Binance WebSocket.
 通过 Binance WebSocket 获取实时行情。

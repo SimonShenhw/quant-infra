@@ -4,10 +4,19 @@ Portfolio and Position Management.
 Tracks positions, P&L, and generates performance metrics.
 Integrates with the EventBus via FillEvent handlers.
 
+HONESTY NOTE — legacy/demonstration layer, NOT in the current result path:
+published v11+ metrics come from the run scripts' own equity loop, not
+this class.  Known documented quirk kept as-is:
+  - L-7: summary() annualises Sharpe with sqrt(252) regardless of bar
+    frequency — wrong for 1h/tick marks. See REVIEW_2026-06-10.md L-7.
+
 组合与持仓管理。
 
 跟踪持仓、盈亏，并生成绩效指标。
 通过 FillEvent 处理器与 EventBus 集成。
+
+诚实披露：遗留/演示层，不在 v11+ 出结果路径上。已知问题 L-7：summary()
+一律用 sqrt(252) 年化 Sharpe，对 1h/tick 级数据是错的——如实记录、未修复。
 """
 from __future__ import annotations
 

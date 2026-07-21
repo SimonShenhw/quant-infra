@@ -1,3 +1,15 @@
+# ============================================================================
+# HISTORICAL ARTIFACT / 历史存档 - paper-trading DEMO entry - superseded by run_paper_daily.py
+# Kept as project record. Results produced before the C-1 ms->us timestamp
+# fix (2026-06-10) are unreliable as published; the current pipeline is
+# run_v13_final.py (research) + run_paper_daily.py (live).
+# See REVIEW_2026-06-10.md for the full audit trail.
+# 保留作为项目演进记录；C-1 时间戳修复(2026-06-10)之前产出的结果不可作为
+# 依据；当前管线见 run_v13_final.py 与 run_paper_daily.py。
+# EXTRA (REVIEW L-6): can run inference on RANDOM weights - the exact
+# v11.1 incident pattern. Never use for real tracking.
+# 额外警告(L-6)：可能以随机权重运行（v11.1 事故同款），禁用于真实记账。
+# ============================================================================
 """
 run_paper.py — Paper Trading Entry Point.
 模拟盘入口。

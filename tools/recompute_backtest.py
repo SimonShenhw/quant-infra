@@ -1,6 +1,19 @@
 """
 recompute_backtest.py — Recompute backtest from saved fold checkpoints.
 
+⚠️ WARNING (REVIEW_2026-06-10.md M-12) — DO NOT USE without adding a guard:
+this tool regenerates CPCV splits from the CURRENT lake's n_samples with NO
+fingerprint check against the checkpoints. The data lake was extended to
+2021 on 2026-07-13, so n_samples changed and every fold↔split mapping for
+older checkpoints (folds/, folds_v12, folds_v13) is now silently WRONG —
+"OOS" predictions would partly be in-sample. The newer research tools
+(research_rank_weighted.py etc.) store n_samples inside each fold ckpt and
+assert it before inference; port that guard here before trusting output.
+⚠️ 警告（M-12）：本工具按当前湖的样本数重生成 CPCV split，与 ckpt 无指纹
+校验。2026-07-13 数据湖扩窗后，旧 fold 的 split 映射已全部静默失效
+（"OOS" 会混入样本内）。新研究工具已把 n_samples 存进 fold ckpt 并在推理
+前断言——先移植该守卫再使用本工具。
+
 Avoids the ~80min retrain when ONLY the backtest config changes (TWAP
 slippage, vol filter, min_hold). Loads checkpoints/<folds_dir>/fold_*.pt
 and runs OOS inference + a configurable backtest with slippage.

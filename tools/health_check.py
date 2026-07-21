@@ -1,10 +1,26 @@
 """
-One-command health check for the unattended paper-trading system.
+One-command health check for the unattended paper-trading system (read-only).
 无人值守系统健康检查（只读）。Usage: python tools/health_check.py
 
-Checks: last run recency, per-ledger continuity/gaps, cumulative returns,
-carry funding income, O2 gross ramp, DB backups, gate countdowns.
-Exit code: 0 healthy, 1 warnings, 2 critical (stale > 3 days).
+WHAT: last-run recency, per-ledger continuity/gaps, cumulative returns,
+carry funding income, O2 gross ramp, DB backups, run_meta error notes,
+September gate countdowns. Exit code: 0 healthy, 1 warnings, 2 critical
+(freshest ledger > 3 days stale).
+
+WHY a deadman exists at all: both result-invalidating bugs (v11.1 random
+weights, C-1 us timestamps) were SILENT — the pipeline kept "succeeding"
+while the output was garbage, and a pipeline that silently STOPS is the
+same failure shape wearing different clothes. --deadman (run nightly by the
+watchdog scheduled task) therefore converts staleness into a VISIBLE
+Desktop artifact (PAPER_RUN_FAILED.txt). It is the second leg of the F1
+alert chain: leg 1 = the daily runner's nonzero exit makes loud failures
+visible; leg 2 = this watchdog catches the case where the scheduler itself
+died and nothing exits at all. The DB is opened read-only by design: a
+health probe must never be able to perturb the evidence ledgers.
+中文：两个历史致命 bug 都是静默失败——“安静地停摆”同样致命；--deadman
+把停摆变成桌面可见哨兵（F1 告警链第二腿：第一腿靠非零退出报响亮故障，
+本腿捕获调度器本身死掉、无人报错的情形）；只读打开数据库，体检永远
+不可能扰动证据账本。
 """
 from __future__ import annotations
 
@@ -16,9 +32,12 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
 DB = BASE / "paper_daily.db"
+# Pre-registered decision dates (ROADMAP_2026-07-13 Phase 3) — the criteria
+# were frozen before the evidence; do not move them to fit the data.
+# 预注册 gate 日期：判据先于证据写死，不得事后挪动。
 GATES = {"carry 60d gate": "2026-09-11", "v13 90d gate": "2026-09-15"}
-STALE_WARN_DAYS = 2
-STALE_CRIT_DAYS = 3
+STALE_WARN_DAYS = 2   # 1-day lag is normal (timezones/late runs) / 1天滞后属正常
+STALE_CRIT_DAYS = 3   # 3+ days = pipeline presumed dead -> Desktop sentinel / 视为停摆
 
 
 def gaps_in(dates):

@@ -6,12 +6,26 @@ v2: Kelly Criterion position sizing based on model confidence.
      Kelly_fraction = edge / odds = (p*b - q) / b
      where p = win_prob (from signal strength), b = avg_win/avg_loss
 
+HONESTY NOTE — legacy/demonstration layer, NOT in the current result path:
+the published v11+ results use fixed 50/50 long-short sizing inside the
+run scripts; this Kelly sizer only serves the EventBus demo stack.  Known
+documented issue kept as-is:
+  - M-10: the equity estimate in handle_signal() counts short positions'
+    market value via abs(quantity) as a POSITIVE asset, overstating the
+    sizing base for net-short books.  Documented, not fixed — see
+    REVIEW_2026-06-10.md ① and M-10.
+
 执行处理器 - 将 SignalEvent 转换为 OrderEvent。
 
 v2: 基于模型置信度的凯利公式仓位管理。
      仓位大小 = Kelly系数 * 权益 / 价格
      Kelly系数 = 优势 / 赔率 = (p*b - q) / b
      其中 p = 胜率（来自信号强度），b = 平均盈利/平均亏损
+
+诚实披露：遗留/演示层，不在 v11+ 出结果路径上——已发布结果在 run 脚本中
+用固定 50/50 仓位，并未使用本 Kelly 模块。已知问题 M-10：权益估计用
+abs(数量) 把空头市值当正资产，净空头时高估仓位基数——如实记录、未修复。
+见 REVIEW_2026-06-10.md ① 与 M-10。
 """
 from __future__ import annotations
 
@@ -141,6 +155,11 @@ class ExecutionHandler:
                 if is_closing:
                     self.record_trade_result(pnl_pct)
 
+        # HONESTY NOTE (M-10): abs() treats short market value as positive
+        # equity — a short book inflates the sizing base instead of reducing
+        # it. Documented, not fixed (legacy path). See REVIEW_2026-06-10.md.
+        # 诚实披露（M-10）：abs() 把空头市值当正资产，空头账本会放大而非
+        # 收缩仓位基数。如实记录、未修复（遗留路径）。
         equity: float = self._portfolio.cash
         for pos in self._portfolio.positions.values():
             equity += abs(pos.quantity) * self._latest_prices.get(

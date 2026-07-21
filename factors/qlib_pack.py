@@ -2,6 +2,22 @@
 Qlib-inspired factor pack — 8 high-quality factors from Microsoft Qlib's Alpha158.
 受 Qlib 启发的因子包 — 8 个来自 Microsoft Qlib Alpha158 的高质量因子。
 
+WHY this pack: candlestick geometry (kmid/klen/kup/klow), momentum (roc10,
+max20_ratio), volume-price coherence (corr_pv) and realized volatility (std20)
+are Alpha158's battle-tested primitives — cheap, causal, OHLCV-only.
+为什么选这组：K 线几何（kmid/klen/kup/klow）、动量（roc10/max20_ratio）、
+量价一致性（corr_pv）与已实现波动率（std20）是 Alpha158 久经检验的原语——
+计算便宜、严格因果、只需 OHLCV。
+
+IC evidence (2026-06-10 factor_analyzer rerun on TRUE 1h bars, 24h horizon):
+std20 and klen are the two STRONGEST factors in the whole library
+(|IC| 0.077 / 0.066, negative sign = low-volatility effect), and klow —
+wrongly dropped in v12 on corrupted data — ranked #5. Lesson: re-derive factor
+rankings after any data fix.
+IC 证据（2026-06-10 在修复后的真 1h 数据上重跑 factor_analyzer，24h 周期）：
+std20 与 klen 是全库最强两个因子（|IC| 0.077/0.066，负号=低波动效应）；
+v12 在污染数据上错杀的 klow 实为第 5。教训：数据修复后必须重排因子。
+
 Reference: github.com/microsoft/qlib/blob/main/qlib/contrib/data/handler.py
 """
 from __future__ import annotations
@@ -25,7 +41,8 @@ class KMid(BaseFactor):
 @register_factor
 class KLen(BaseFactor):
     """Bar range as fraction of open: (high-low)/open. Volatility proxy.
-    K线长度：(高-低)/开，波动率代理。"""
+    #2 factor by |IC| on true 1h data (24h |IC| 0.066, low-vol effect).
+    K线长度：(高-低)/开，波动率代理。真 1h 数据上 |IC| 第 2（24h 0.066，低波动效应）。"""
     name = "klen"
     def compute(self, open_, high, low, close, volume) -> Tensor:
         return (high - low) / open_.clamp(min=1e-8)
@@ -44,7 +61,8 @@ class KUp(BaseFactor):
 @register_factor
 class KLow(BaseFactor):
     """Lower shadow: (min(open,close) - low) / open. Buying pressure bottom.
-    下影线：(min(开,收) - 低)/开，下方买压。"""
+    Wrongly dropped in v12 (corrupted-data artifact); #5 by |IC| on true 1h data.
+    下影线：(min(开,收) - 低)/开，下方买压。v12 在污染数据上错杀；真 1h 数据 |IC| 第 5。"""
     name = "klow"
     def compute(self, open_, high, low, close, volume) -> Tensor:
         lower = torch.minimum(open_, close) - low

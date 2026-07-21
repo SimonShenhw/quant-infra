@@ -15,6 +15,29 @@ Data lake structure:
             trades_DD_HHMMSS.parquet
             depth_DD_HHMMSS.parquet
 
+WHY this module carries the project's most important fix (C-1, the ms→µs
+timestamp bug): Binance Vision silently switched kline CSV timestamps from
+milliseconds to MICROSECONDS in its 2025-01+ monthly archives. Downstream
+1h aggregation buckets by `open_time // 3_600_000` — correct for ms, but on
+µs values that divisor spans only 3.6 SECONDS, so nearly every raw 5m row
+landed in its own bucket and passed through as a fake "1h bar". 97% of
+v11/v12's "117K hourly bars" were raw 5m bars: labels were really 5m
+returns, "48h holds" were ~4h, and every headline number from those
+versions was discarded and rerun as v13. The fix lives HERE, at the single
+ingestion choke point (`load_klines`), so every consumer — training runs,
+factor_analyzer, extended-window research, invariant tests — inherits
+normalized ms timestamps instead of each re-fixing (or forgetting to fix)
+the units. Guarded by tests/run_invariants.py::t1_timestamp_golden.
+为什么本模块承载着全项目最重要的修复（C-1，ms→µs 时间戳 bug）：Binance
+Vision 自 2025-01 月度归档起把 K 线 CSV 时间戳从毫秒静默切换为微秒。下游
+1h 聚合按 `open_time // 3_600_000` 分桶——对毫秒正确，但对微秒该除数只覆盖
+3.6 秒，几乎每根原始 5m 行都落入独立桶、伪装成"1h bar"通过。v11/v12 的
+"11.7 万小时样本"中 97% 是原始 5m bar：标签实为 5m 收益、"48h 持仓"实为约
+4 小时，两版全部结果作废并以 v13 重跑。修复放在这里——唯一的摄取咽喉
+（`load_klines`）——训练、factor_analyzer、扩窗研究、不变量测试全部继承
+归一化后的毫秒时间戳，而不是各自修（或忘修）单位。由
+tests/run_invariants.py::t1_timestamp_golden 金标测试守护。
+
 任务3：Parquet数据湖加载器。
 
 提供统一接口，从分区Parquet数据湖加载数据到Polars DataFrame或PyTorch张量。
@@ -114,19 +137,34 @@ def load_klines(
     if not normalized:
         return pl.DataFrame()
     combined: pl.DataFrame = pl.concat(normalized)
-    # Binance Vision switched kline timestamps from milliseconds to
-    # microseconds in 2025-01 archives; normalize everything to ms so
-    # downstream time-bucket aggregation ( // 3_600_000 ) stays correct.
-    # Binance Vision 自 2025-01 起 K 线时间戳从毫秒改为微秒；统一归一化为
-    # 毫秒，保证下游按毫秒分桶的 1h 聚合正确。
+    # C-1 FIX (the bug that invalidated all v11/v12 results): Binance Vision
+    # switched kline timestamps from milliseconds to microseconds in 2025-01
+    # archives. Unnormalized, `// 3_600_000` bucketing turns µs rows into
+    # 3.6-second bins — every raw 5m bar silently became its own "1h bar"
+    # (97% of the v11/v12 sample). Normalize per ROW, not per file: a lake
+    # spanning 2024 and 2025 partitions mixes both units in one frame.
+    # Threshold 1e14 cleanly separates the magnitudes: ms epochs are ~1.7e12,
+    # µs epochs ~1.7e15 (1e14 as ms would be year ~5138 — unreachable).
+    # C-1 修复（推翻 v11/v12 全部结果的 bug）：Binance Vision 2025-01 归档起
+    # 时间戳从毫秒切微秒。不归一化时 `// 3_600_000` 分桶把微秒行装进 3.6 秒的
+    # 桶——每根原始 5m bar 静默变成独立"1h bar"（占 v11/v12 样本的 97%）。
+    # 按行归一化而非按文件：横跨 2024 与 2025 分区的湖在同一帧里混着两种单位。
+    # 阈值 1e14 干净分隔两个量级：毫秒纪元约 1.7e12，微秒约 1.7e15
+    # （1e14 若按毫秒解释是公元 5138 年——不可能到达）。
     combined = combined.with_columns(
         pl.when(pl.col("open_time") > 100_000_000_000_000)
         .then(pl.col("open_time") // 1000)
         .otherwise(pl.col("open_time"))
         .alias("open_time")
     )
-    # unique() does not guarantee order — dedupe first, then sort.
-    # unique() 不保证顺序——先去重再排序。
+    # Dedupe BEFORE sort, in this order deliberately: polars unique() does
+    # NOT guarantee output row order, so a trailing sort must re-establish
+    # chronology or downstream causal windows would see shuffled time.
+    # Duplicates are real here — overlapping month re-downloads can repeat
+    # boundary rows, and pre/post-normalization reruns collide on open_time.
+    # 刻意先去重、后排序：polars unique() 不保证输出顺序，必须以末尾的 sort
+    # 重建时间序，否则下游因果窗口看到的是乱序时间。重复行真实存在——月度
+    # 重下载会重复边界行，归一化前后重跑也会在 open_time 上碰撞。
     combined = combined.unique(subset=["open_time"], keep="first").sort("open_time")
     return combined
 

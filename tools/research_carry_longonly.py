@@ -2,13 +2,17 @@
 Offline research: long-only variants + funding-carry sleeve vs v13 long-short.
 离线研究：多头变体 + funding carry sleeve，与 v13 多空对照。
 
-Motivation (2026-07-01): after 20 live days the v13 basket is -7.5% with
+HYPOTHESIS (2026-07-01): after 20 live days the v13 basket is -7.5% with
 live rank IC ~ 0; the bleeding is concentrated in the SHORT leg (squeezed
-shorting strong coins), while the long leg holds up. Literature suggests
-funding carry as a slow, low-turnover crypto signal (Crypto Carry, BIS WP
-1087) — with the caveat that carry Sharpe decayed sharply in 2025
-(arXiv:2510.14435). This script tests, on the SAME fixed data / cost model /
-H-1-correct engine as run_v13_final.py:
+shorting strong coins), while the long leg holds up. If the short leg is
+the problem, a long-only or hedged-long variant should salvage the signal;
+independently, literature suggests funding carry as a slow, low-turnover
+crypto signal (Crypto Carry, BIS WP 1087) — with the caveat that carry
+Sharpe decayed sharply in 2025 (arXiv:2510.14435).
+
+METHOD: test on the SAME fixed data / cost model / H-1-correct engine as
+run_v13_final.py (why: isolate the portfolio-construction question from
+every other degree of freedom):
 
   BENCH   equal-weight buy & hold of the 20-asset universe (no costs)
   A       v13 long-short banded top3 (baseline reproduction)
@@ -21,6 +25,29 @@ H-1-correct engine as run_v13_final.py:
 
 OOS model predictions are reconstructed from checkpoints/folds_v13 with the
 same CPCV splits (aborts if n_samples differs — split fingerprint check).
+
+VERDICT (2026-07-02, full numbers in RESEARCH_2026-07-02.md): the long-only
+variants were DOMINATED — B is -9.6% and ~pure beta (corr +0.92 with BENCH,
+maxDD 54.5%); hedging the beta away (C) leaves only +2.6%: the long leg's
+pure alpha is thin, so v13's backtest alpha lives mostly in the short leg
+and the live pain is regime-dependent, not fixable by construction. The
+REAL FIND is D: the carry sleeve earns +14.6% / Sharpe 0.53 / maxDD 22%,
+with +$106K of its PnL coming from funding collection, half the turnover,
+and — decisively — corr(A, D) = -0.01: completely UNCORRELATED with the
+model signal and free of model-overfit risk. E (50/50) reaches Sharpe 0.92
+with the lowest maxDD (19.6%), textbook diversification. Funding accrual
+barely dents v13 itself (-2.3pp over 18 months). This result launched the
+carry paper track (ROADMAP Phase 0) and made carry the v14 backbone
+candidate.
+
+结论（详见 RESEARCH_2026-07-02.md）：多头变体全面落败——B 纯多头 -9.6%
+且≈纯 beta（与基准相关 +0.92，maxDD 54.5%）；对冲掉指数后的 C 只剩
++2.6%，说明多头腿纯 alpha 很薄、v13 回测 alpha 主要在空头腿，live 困境
+是 regime 依赖而非组合构建可修。真发现是 D carry sleeve：+14.6% /
+Sharpe 0.53，收益大头（+$106K）来自 funding 收取，换手只有模型策略一半，
+且与模型信号完全不相关（corr=-0.01）、无模型过拟合风险。E 组合
+Sharpe 0.92、maxDD 最低。由此开出 carry 并行 paper track，carry 成为
+v14 骨架候选。
 
 DISCLOSURE: every variant here is an additional research trial; the DSR
 n_trials count grows accordingly. Nothing in this script touches the live
@@ -53,7 +80,12 @@ from run_v13_final import (  # reuse the exact v13 pipeline / 复用v13管线
 from tools.validation_stats import probabilistic_sharpe
 
 SEQ_LEN = 24
-N_SAMPLES_EXPECTED = 13105  # split fingerprint (M-12 guard) / split指纹校验
+# Split fingerprint (M-12 guard): CPCV splits are regenerated from n_samples,
+# so if the lake grows (it DID on 2026-07-13) the fold<->split mapping breaks
+# silently. This assert makes the failure loud instead.
+# split 指纹（M-12 防护）：CPCV 切分由 n_samples 重生成，数据湖变化（2026-07-13
+# 已扩容）会让 fold 映射静默错位——这里改为响亮报错。
+N_SAMPLES_EXPECTED = 13105
 FUNDING_DB = str(BASE / "funding_rates.db")
 CARRY_LOOKBACK = 72  # trailing 3d mean funding as carry signal / 3天均值作carry信号
 
@@ -150,6 +182,11 @@ def run_variant(
     for t in range(n):
         pnl = float((w * r1h[t]).sum())
         if fund_accrual and fund is not None:
+            # Perp funding accrual: rate is quoted per 8h -> /8 for hourly.
+            # Sign: LONGS PAY positive funding (shorts receive), hence the
+            # minus — this is exactly the payment the carry sleeve harvests.
+            # 永续资金费按 8h 计价，/8 折成小时计提；多头支付正 funding
+            # （空头收取），故取负——carry sleeve 赚的正是这笔支付。
             fp = float(-(w * fund[t + SEQ_LEN - 1] / 8.0).sum())
             pnl += fp
             fund_pnl_cum += fp * equity
@@ -246,8 +283,14 @@ def main():
     cov = (fund != 0).mean()
     print(f"  funding matrix coverage: {cov:.1%}")
 
-    # carry signal: NEGATIVE trailing mean funding (long low/negative funding)
-    # carry信号：3天均值funding取负（做多低/负funding，做空高funding）
+    # carry signal: NEGATIVE trailing mean funding (long low/negative funding,
+    # short high funding). WHY: funding is paid by the crowded side, so fading
+    # it collects the payment (BIS WP 1087); the 3d trailing mean turns the
+    # 8h prints into a SLOW signal — low turnover is the whole point, and it
+    # needs no model (no overfit risk).
+    # carry 信号：3 天均值 funding 取负（做多低/负 funding、做空高 funding）。
+    # funding 由拥挤方支付，反向持有即收取该支付；3 天均值把 8h 打点变成
+    # 慢信号——低换手正是意义所在，且完全不依赖模型。
     n = scores.shape[0]
     carry_sig = np.zeros_like(scores)
     fmat = fund  # (T, A)

@@ -2,17 +2,41 @@
 Combinatorial Purged Cross-Validation (CPCV).
 组合净化交叉验证。
 
-Implements de Prado's CPCV for financial time-series:
+WHAT — implements López de Prado's CPCV (Advances in Financial Machine
+Learning) for financial time-series:
   - Splits data into N contiguous groups
   - Tests all C(N, k) combinations of k test groups
   - Purges training samples near test boundaries (remove lookback overlap)
   - Adds embargo gap after test boundaries (remove feature leakage)
+
+WHY CPCV instead of walk-forward (the v10 decision — see README version
+history): WFO leaks information at every train/test boundary and yields
+only ONE backtest path, while each fold trains on just the data before it.
+CPCV explicitly purges + embargoes every boundary and produces C(N, k)
+paths: every sample gets a leakage-free out-of-sample prediction (later
+ensemble-averaged), and each fold trains on ~(N-k)/N of ALL data — more
+training data per fold than any expanding-window scheme.
+
+Key invariants / 关键不变量:
+  - Groups are CONTIGUOUS in time; shuffling would destroy the temporal
+    structure that purge/embargo protect.
+  - purge_bars must cover label horizon + feature lookback overlap
+    (v13: purge=48 for the 24h label with seq_len=24 on true 1h bars).
+  - CPCV controls leakage but NOT researcher degrees of freedom accumulated
+    across 13 versions — hence v13 reports the Deflated Sharpe Ratio (0.11)
+    next to every headline number.
 
 实现 de Prado 的 CPCV 方法:
   - 将数据分为 N 个连续组
   - 测试所有 C(N,k) 种 k 组测试组合
   - 在测试边界附近净化训练样本（移除回看重叠）
   - 在测试边界后添加 embargo 间隔（移除特征泄露）
+
+为什么用 CPCV 而非 walk-forward（v10 决策，见 README 版本史）：WFO 在每个
+训练/测试边界都有泄露且只产生一条回测路径；CPCV 显式净化/隔离每个边界，
+产生 C(N,k) 条路径——每根 bar 都获得无泄露的 OOS 预测（下游做集成平均），
+且每折仍能用约 (N-k)/N 的全量数据训练。注意：CPCV 只控泄露、不控多版本
+迭代累积的研究者自由度——因此 v13 在 Sharpe 旁并列披露 DSR。
 """
 from __future__ import annotations
 
@@ -43,10 +67,16 @@ def generate_cpcv_splits(
         Number of groups held out for testing per split. / 每个划分中的测试组数。
     purge_bars : int
         Remove training samples within this many bars BEFORE each test group start.
+        Must cover label horizon + feature lookback so no train label overlaps
+        a test feature window (v13: 48 = 24h label + seq_len 24).
         在每个测试组起点之前，移除此范围内的训练样本。
+        必须覆盖标签持有期+特征回看窗口（v13 取 48 = 24h 标签 + 24 步序列）。
     embargo_bars : int
         Remove training samples within this many bars AFTER each test group end.
+        Guards against serial correlation carrying test-period information into
+        training samples that immediately follow the test block.
         在每个测试组终点之后，移除此范围内的训练样本。
+        防止序列相关性把测试期信息带入紧随其后的训练样本。
 
     Returns / 返回
     -------

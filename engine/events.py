@@ -5,10 +5,20 @@ All communication between engine components flows through typed Event objects
 dispatched via a central EventBus.  This eliminates coupling between the
 matching engine, portfolio, strategy, and execution layers.
 
+HONESTY NOTE — legacy/demonstration layer, NOT in the current result path:
+the published v11+ numbers are produced by a simplified vectorized long-short
+loop inside the run_v* scripts; none of them flow through this EventBus /
+MatchingEngine / RiskManager stack.  Kept as architecture demonstration and
+for the single-asset demo (main.py).  See REVIEW_2026-06-10.md ① and M-9.
+
 事件驱动架构 - 核心事件类型与事件总线。
 
 所有引擎组件之间的通信均通过类型化的 Event 对象经中央 EventBus 分发。
 消除了撮合引擎、组合管理、策略与执行层之间的耦合。
+
+诚实披露：本 EventBus 栈是遗留/演示层，不在 v11+ 出结果的路径上——已发布
+数字来自 run 脚本中的简化向量化回测循环。保留用于架构演示与单资产 demo
+（main.py）。见 REVIEW_2026-06-10.md ① 与 M-9。
 """
 from __future__ import annotations
 

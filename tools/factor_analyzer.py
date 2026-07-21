@@ -1,12 +1,40 @@
 """
-Alphalens-style factor analyzer.
-Alphalens 风格的因子分析器。
+Alphalens-style factor analyzer — per-factor IC / IC-IR / quintile spread.
+Alphalens 风格的因子分析器——逐因子 IC / IC-IR / 五分位价差。
 
-For each factor, computes:
-  - IC (Information Coefficient): rank correlation with forward returns
+WHAT: for every registered factor, computes across 1h/6h/24h/48h horizons:
+  - IC (Information Coefficient): cross-sectional rank correlation between
+    factor[t] and the h-bar forward return
   - IC IR (mean / std of IC): stability of the signal
-  - Quintile returns: long top-quintile, short bottom-quintile spread
-  - Decay: IC at 1h, 4h, 24h, 48h horizons
+  - Quintile spread at the 24h horizon (long top 20% / short bottom 20%),
+    aligned with the v13 holding period
+
+WHY THIS VERSION EXISTS (REVIEW_2026-06-10 M-3 fix — both flaws repaired):
+  1. TRUE 1h aggregation BEFORE any IC math: raw 5m rows go through
+     aggregate_5m_to_1h first (timestamps already ms-normalized by
+     lake_loader after the C-1 ms->us fix). The pre-fix analyzer computed
+     IC on raw 5m rows — 97% of its "1h bars" were 5m bars — which
+     silently produced a wrong factor ranking (v12's drop list killed
+     klow, actually #5 by |IC_24h| on clean data).
+  2. Horizon alignment fix: IC at horizon h pairs factor[:-h] with
+     close[h:]/close[:-h] - 1, the true h-bar forward return; the old
+     code shifted one extra bar (off-by-one).
+  3. Real funding rates are forward-filled from funding_rates.db and fed
+     to funding-aware factors via `extras` — the old OHLCV proxy channel
+     was constant-zero after normalization (C-1 chain effect, H-4).
+
+The 2026-06-10 rerun on clean data re-ranked everything: std20/klen lead
+at the 24h horizon and only {macd, volume_zscore} remain noise — this is
+where run_v13_final.DROP_FACTORS comes from. Rerun this tool after ANY
+data-pipeline change; a factor list derived from corrupted data poisons
+every downstream model.
+
+中文说明（WHY）：本版本先把 5m 原始行聚合成**真 1h bar** 再算 IC（M-3
+修复——修复前的 IC 算在被 C-1 时间戳 bug 污染的原始 5m 数据上，因子排名
+是错的，v12 因此错杀了实为第 5 名的 klow）；horizon 对齐修正了旧版多移
+一位的错位；真实资金费率经 extras 传入 funding 因子（旧代理通道标准化后
+恒为零）。数据管线任何改动后必须重跑本工具——v13 的 DROP_FACTORS 名单
+即出自 2026-06-10 的重跑。
 
 Usage:
     python tools/factor_analyzer.py
@@ -40,7 +68,14 @@ def aggregate_5m_to_1h(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def load_funding(symbol: str, bar_times_ms: np.ndarray, device: torch.device) -> Tensor:
-    """Forward-fill real funding rates onto bar timestamps. / 真实资金费率前向填充到bar时间戳。"""
+    """Forward-fill real funding rates onto bar timestamps (8h cadence -> 1h).
+    searchsorted(side="right") - 1 picks the LAST rate at-or-before each bar
+    time — causal by construction. WHY this matters: the pre-fix pipeline
+    searched ms funding stamps with us bar stamps, so every bar matched the
+    final record (look-ahead AND constant, hence ~0 after z-score — C-1).
+    真实资金费率前向填充到 bar 时间戳：取 bar 时点或之前最近一条，构造上
+    因果。修复前 ms/µs 单位错配使所有 bar 匹配到最后一条记录（前视且恒定，
+    标准化后≈0）——本函数即针对该 C-1 连锁后果的正确实现。"""
     import os
     import sqlite3
     db_path = str(Path(__file__).resolve().parent.parent / "funding_rates.db")
@@ -131,8 +166,12 @@ def main():
     raw = load_klines_multi(interval="5m", min_rows=40000)
     syms = sorted(raw.keys())[:20]
 
-    # aggregate 5m -> 1h, then align all symbols on common timestamps
-    # 5m 聚合为 1h，再按公共时间戳对齐所有标的（避免位置错位）
+    # aggregate 5m -> 1h, then align all symbols on common timestamps.
+    # WHY intersection (not positional head()): symbols have different gaps;
+    # positional alignment would pair different clock times across assets and
+    # corrupt every cross-sectional rank correlation below.
+    # 5m 聚合为 1h，再按公共时间戳交集对齐所有标的——按位置对齐会把不同
+    # 时刻配成同一截面，横截面 rank 相关全部失真。
     agg = {s: aggregate_5m_to_1h(raw[s]) for s in syms}
     common_ts = None
     for s in syms:

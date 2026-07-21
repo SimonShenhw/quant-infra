@@ -14,6 +14,28 @@ Features:
   - Auto-extract ZIP → CSV → Polars → Parquet
   - Partitioned storage: data_lake/{asset}/{year}/{month}/
 
+WHY monthly-partition parquet + skip-if-exists: the lake is grown
+incrementally (6-month initial pull, then backfill_2021.py extended it to
+2021+). One parquet per (symbol, month) makes the unit of work idempotent —
+reruns skip everything already on disk, so a crashed or interrupted
+download resumes for free, and extending the date range never re-downloads
+existing months. 404s are expected and tolerated silently: monthly archives
+only exist from each symbol's listing date (APT/ARB/OP/SUI listed 2022-23),
+so "missing month" is data reality, not an error.
+为什么用月度分区 parquet + 已存在即跳过：数据湖是增量生长的（先拉 6 个月，
+再由 backfill_2021.py 扩到 2021+）。以 (symbol, 月) 为工作单元天然幂等——
+重跑自动跳过磁盘上已有的部分，下载中断可零成本续传，扩窗也绝不重复下载。
+404 是预期内且静默容忍的：月度归档只从各币种上市日起存在（APT/ARB/OP/SUI
+2022-23 才上市），"缺月"是数据现实而非错误。
+
+NOTE on timestamps: this module stores archive CSVs AS-IS (no unit fix).
+Binance Vision switched kline timestamps to microseconds in 2025-01
+archives; the ms/µs normalization deliberately lives downstream in
+lake_loader.load_klines (C-1 fix) so raw files stay bit-faithful.
+时间戳说明：本模块按原样落盘（不修单位）。Binance Vision 2025-01 起归档
+时间戳切微秒；ms/µs 归一化刻意放在下游 lake_loader.load_klines（C-1 修复），
+保持原始文件与源逐位一致。
+
 任务1：Binance公开数据归档下载器。
 
 从 data.binance.vision（Binance官方S3托管的公开数据归档）下载历史
@@ -105,7 +127,11 @@ async def download_and_convert(
     out_name: str = f"{data_type}_{interval}.parquet" if data_type == "klines" else f"{data_type}.parquet"
     parquet_path: str = os.path.join(part_dir, out_name)
 
-    # skip if already exists / 如已存在则跳过
+    # skip if already exists — the idempotence that makes reruns/backfills
+    # resumable; readability of the parquet is the "exists" test, so a
+    # half-written file from a crash falls through to re-download
+    # 已存在即跳过——重跑/回填可续传的幂等性来源；以"parquet 可读"为存在判据，
+    # 崩溃留下的半截文件会落入重新下载
     if os.path.exists(parquet_path):
         try:
             existing: pl.DataFrame = pl.read_parquet(parquet_path)
@@ -117,6 +143,9 @@ async def download_and_convert(
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
                 if resp.status == 404:
+                    # expected for months before a symbol's listing date
+                    # (e.g. APT/ARB/OP/SUI) — not an error, return empty
+                    # 币种上市前的月份必然 404（如 APT/ARB/OP/SUI）——非错误，返回空
                     return "", 0
                 if resp.status != 200:
                     return "", 0

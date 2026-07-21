@@ -6,6 +6,27 @@ Binance funding rate updates every 8h. Endpoint:
   https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1000
 No auth required. Returns list of {fundingTime, fundingRate, symbol}.
 
+WHY funding matters: it is the crowding/carry signal behind the
+funding_rate factor and the v13 carry sleeve — one of the few slow
+(8h-cadence) signals in crypto. Getting the REAL series (instead of the
+OHLCV proxy) was the v11.2 fix for the train/serve mismatch (REVIEW H-4).
+为什么 funding 重要：它是 funding_rate 因子与 v13 carry sleeve 背后的
+拥挤度/carry 信号，也是 crypto 少数"慢信号"（8 小时更新）之一。用真实序列
+替代 OHLCV proxy 正是 v11.2 对训练/推理不一致（REVIEW H-4）的修复。
+
+STATUS — honest scope note: this is the v11.2-era API fetcher, capped at
+the API's last ~1000 records per symbol (~1 year at 8h cadence). The
+current result path populates the SAME funding_rates.db (same schema) via
+data/funding_archive_downloader.py from Binance Vision archives, which
+provides the full history; run_v13_final.py and run_paper_daily.py read
+the db / CCXT directly and do not import this module. Kept as a quick
+no-dependency top-up tool for recent records.
+状态——如实说明：这是 v11.2 时期的 API 抓取器，受 API 限制每币种只有最近
+约 1000 条（按 8h 频率约一年）。当前结果路径由 data/funding_archive_downloader.py
+从 Binance Vision 归档灌同一个 funding_rates.db（同 schema），覆盖完整历史；
+run_v13_final.py 与 run_paper_daily.py 直接读库/走 CCXT，并不导入本模块。
+保留用作零依赖的近期数据快速补抓工具。
+
 资金费率每8小时更新一次，无需认证。
 """
 from __future__ import annotations

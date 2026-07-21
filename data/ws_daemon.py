@@ -10,6 +10,26 @@ Features:
   - In-memory buffer → periodic Parquet flush (every N rows or M seconds)
   - Graceful shutdown on SIGINT/SIGTERM
 
+STATUS — honest scope note: research/data-collection infrastructure
+(v10-era, CLI-only; not imported by any pipeline). The current v13+ result
+path trains on archived klines via lake_loader, and live paper trading uses
+paper_trading/realtime_feed.py — NOT this daemon. Its purpose is to
+accumulate tick-level trade/depth data (the `realtime/` lake partitions)
+for future LOB-microstructure research that archives cannot provide.
+状态——如实说明：研究/采集基础设施（v10 时期，仅 CLI 入口；无任何管线导入）。
+当前 v13+ 结果路径经 lake_loader 用归档 K 线训练，模拟盘实时行情走
+paper_trading/realtime_feed.py——不是本守护进程。它的定位是积累归档拿不到的
+tick 级成交/深度数据（数据湖的 realtime/ 分区），供未来 LOB 微观结构研究。
+
+WHY heartbeat + backoff + buffered flush: a collector's failure mode is
+silent death. The 20s ping and 30s recv timeout detect dead connections;
+exponential backoff (reset on success) reconnects without hammering the
+endpoint; flush-by-rows-or-seconds bounds both memory and data loss on
+crash to one flush window.
+为什么心跳+退避+缓冲刷盘：采集器的失效模式是"静默死亡"。20 秒 ping 与
+30 秒收包超时探测死连接；指数退避（成功即重置）在不轰炸端点的前提下重连；
+按行数或秒数刷盘把崩溃时的内存占用和数据丢失都限定在一个刷盘窗口内。
+
 任务2：WebSocket守护进程 - 实时LOB/交易流监听器。
 
 异步守护进程，连接Binance WebSocket流并将数据写入数据湖的Parquet文件。

@@ -22,6 +22,15 @@ We implement a flexible Encoder-Decoder Transformer with:
   - 可学习位置编码，适配交易日历
   - 多头自注意力/交叉注意力，CUDA优化
   - 可配置的因子数量作为输入通道
+
+STATUS (honest note): this was the v1-v6 single-asset backbone. Superseded
+from v7 by model/cross_asset_attention.py — cross-sectional ranking needs
+cross-ASSET interaction, which an encoder-decoder over one asset's history
+cannot express (README v4/v7 history). NOT in the current result path;
+kept as the architectural starting point of the project record.
+现状注记：v1-v6 的单资产骨干网络，v7 起被跨资产注意力模型取代（横截面
+排序需要资产间交互，单资产编解码器表达不了）。不在当前结果路径上，
+作为项目演进起点存档。
 """
 from __future__ import annotations
 

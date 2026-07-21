@@ -5,10 +5,36 @@ Cross-Sectional Multi-Asset Transformer with ListMLE Ranking Loss.
 The model learns to RANK assets by relative performance, not predict
 absolute returns. This avoids the MSE-on-returns trap entirely.
 
+WHY ranking instead of return regression (the v4 decision): absolute
+crypto returns are dominated by market beta and noise — v1-v3 regression
+either overfit or predicted nothing.  Cross-sectional RANKING removes
+the common market component by construction and directly targets what a
+long-short book trades on (Poh, Lim, Zohren, Roberts, arXiv 2012.07149).
+Ranking beat regression decisively in v4 and carried through v13.
+
+HONEST UPDATE (2026-07-13, RESEARCH_2026-07-13_extended_window.md):
+pure rank objectives later proved NOT to monetize in dollar space over
+the full 2021-2026 window — Spearman IC was positive every single year,
+yet every linear monetization of the rank signal (banded top-K,
+rank-weighted book, vol-scaled, GP-smoothed) lost money: the model ranks
+the many small moves correctly (which is what props up IC) while putting
+the few LARGE movers on the wrong side.  ListMLE delivered exactly what
+it was asked to optimize; the ask was wrong.  Production consequently
+moved to magnitude-aware objectives (tools/research_objectives.py; O2 =
+pairwise magnitude-weighted ranking is the v14 model sleeve).  ListMLE
+remains the v13 CONTROL-TRACK objective — its paper track runs unchanged
+to the September gate so the pre-registered comparison stays intact.
+
 Key components:
   - Per-asset temporal encoder (shared weights)
   - Cross-asset attention (learns inter-asset dependencies)
   - ListMLE ranking loss (from Learning to Rank literature)
+
+Status: `listmle_loss` is imported by the v13 result path
+(run_v13_final.py) and the research tools; the CrossSectionalTransformer
+CLASS below is the v4/v5-era model, superseded by CrossAssetGRUAttention
+since v7 and now used only by legacy run scripts (run_v5_final.py,
+run_v6_lowfreq.py, run_cross_sectional.py, hyperparam_search.py).
 
 截面多资产Transformer，带ListMLE排序损失。
 
@@ -16,10 +42,26 @@ Key components:
 模型学习按相对收益对资产进行排序，而非预测绝对收益。
 完全避免了"对收益率做MSE回归"的陷阱。
 
+为什么用排序而非回归（v4 决策）：加密货币绝对收益被市场 beta 与噪声
+主导，v1-v3 的回归要么过拟合要么学不到东西；横截面排序在构造上消去了
+共同市场分量，直指多空组合真正交易的对象（Poh 等，arXiv 2012.07149）。
+
+诚实更新（2026-07-13）：纯 rank 目标后来被证明在美元空间不变现——
+2021-2026 每一年 Spearman IC 均为正，但 rank 信号的所有线性变现方式
+全部亏损：模型排对了大量小幅度名字（撑起 IC），却系统性把少数大幅度
+行情放错边。ListMLE 交付了它被要求优化的东西，是要求本身错了。生产
+已转向幅度感知目标（tools/research_objectives.py，O2 = v14 模型
+sleeve）；ListMLE 保留为 v13 对照 track 的目标函数，照跑到 9 月 gate、
+维持预注册对比不中断。
+
 核心组件:
   - 每资产时序编码器（共享权重）
   - 跨资产注意力（学习资产间依赖关系）
   - ListMLE排序损失（来自Learning to Rank文献）
+
+状态：`listmle_loss` 仍在 v13 出结果路径上；下方的
+CrossSectionalTransformer 类是 v4/v5 时期模型，v7 起被
+CrossAssetGRUAttention 取代，现仅用于遗留 run 脚本。
 """
 from __future__ import annotations
 
@@ -45,8 +87,16 @@ def listmle_loss(scores: Tensor, relevance: Tensor) -> Tensor:
     computes the negative log-likelihood of the permutation defined by
     sorting items by true relevance.
 
+    NOTE — magnitude-blind by construction: a +40% mover and a +0.4% mover
+    are just adjacent ranks to this loss.  That blindness is precisely what
+    the 2026-07-13 research identified as the monetization failure mode
+    (see module HONEST UPDATE); kept as the v13 control-track objective.
+
     ListMLE: 基于Plackett-Luce模型的列表级排序损失。
     给定预测分数和真实相关性标签，计算按真实相关性排序所定义排列的负对数似然。
+    注意——构造上对幅度盲视：+40% 与 +0.4% 在该损失眼中只是相邻名次。
+    这正是 2026-07-13 研究定位的变现失败根源（见模块诚实更新）；
+    作为 v13 对照 track 目标保留。
 
     Parameters / 参数
     ----------
@@ -71,8 +121,14 @@ def listmle_loss(scores: Tensor, relevance: Tensor) -> Tensor:
     # ListMLE: for each position i, compute log-softmax over remaining items
     # ListMLE: 对每个位置i，计算剩余项的log-softmax
     n: int = sorted_scores.size(1)
-    # cumulative logsumexp from the end / 从末尾开始的累积logsumexp
+    # Plackett-Luce NLL needs, at each position i, logsumexp over the SUFFIX
+    # s_i..s_n.  Trick: flip → logcumsumexp (prefix) → flip back = suffix
+    # logsumexp in one vectorized, numerically-stable pass (no O(n^2) loop,
+    # no overflow from raw exp).
     # log P(pi) = sum_{i=1}^{n} [s_{pi(i)} - logsumexp(s_{pi(i)}, ..., s_{pi(n)})]
+    # Plackett-Luce 负对数似然需要每个位置 i 对后缀 s_i..s_n 做 logsumexp。
+    # 技巧：翻转 → logcumsumexp（前缀）→ 再翻转 = 后缀 logsumexp，
+    # 一次向量化完成且数值稳定（无 O(n^2) 循环、无裸 exp 溢出）。
     cumsums: Tensor = torch.logcumsumexp(sorted_scores.flip(dims=[1]), dim=1).flip(dims=[1])
     loss: Tensor = -(sorted_scores - cumsums).mean()
     return loss
@@ -85,7 +141,12 @@ def listmle_loss(scores: Tensor, relevance: Tensor) -> Tensor:
 
 class CrossSectionalTransformer(nn.Module):
     """
-    Multi-asset ranking model.
+    Multi-asset ranking model (v4/v5 era — LEGACY: superseded by
+    CrossAssetGRUAttention since v7; only legacy run scripts and
+    hyperparam_search.py still instantiate this class).
+
+    多资产排序模型（v4/v5 时期——遗留：v7 起被 CrossAssetGRUAttention
+    取代，现仅遗留脚本使用）。
 
     Architecture:
       1. FactorProjection: (B, A, T, F) -> (B, A, T, D)

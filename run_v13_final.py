@@ -18,26 +18,63 @@ v13 changes vs v12 (each tagged with the review finding / literature it answers)
 
   BACKTEST
   - H-1 fix: positions take effect on the bar AFTER the decision bar
-    (TWAP executes during the decision->next-bar window). v12 credited the
-    label bar itself to the new position — pure look-ahead PnL.
+    (TWAP executes during the decision->next-bar window). WHY: v12 credited
+    the label bar itself to the new position — pure look-ahead PnL. The
+    model's entire alpha is concentrated in exactly that bar, so v12 was
+    being paid for a bar that is untradable in reality.
+    H-1 修复：仓位在决策 bar 的下一根才生效。v12 把 label 那根 bar 的收益
+    记给新仓位，等于白拿模型预测的那根 bar（现实中 TWAP 尚未成交）。
   - Banded top-K portfolio (Novy-Marx & Velikov RFS 2016 buy/hold spread;
     qlib TopkDropout): enter a long slot only when rank <= ENTER_BAND,
-    exit only when rank falls below EXIT_BAND. Cuts turnover while keeping
-    signal exposure. Decisions evaluated every DECISION_EVERY bars (daily),
-    same cadence as paper trading -> backtest and paper now test the SAME
-    strategy.
-  - M-6 fix: per-slot TWAP cost on each asset's own price path.
-  - M-1 fix: vol filter threshold is an EXPANDING (causal) quantile.
+    exit only when rank falls below EXIT_BAND. WHY banding: with a weak
+    signal (IC ~0.06) net PnL is decided by NOT trading — N-M&V find the
+    buy/hold spread is the one cost-reduction device that consistently
+    survives across anomalies; here the SAME predictions span -44.5% to
+    +32.6% purely by construction. Decisions evaluated every DECISION_EVERY
+    bars (daily), same cadence as paper trading -> backtest and paper now
+    test the SAME strategy.
+    双阈值 banding：弱信号的钱省在"不交易"上——同一预测矩阵仅因组合构建
+    不同就横跨 -44.5% 到 +32.6%；每日决策与模拟盘同节奏 = 同一个策略。
+  - M-6 fix: per-slot TWAP cost on each asset's own price path (v11/v12
+    priced every leg off the long leg's path).
+  - M-1 fix: vol filter threshold is an EXPANDING (causal) quantile — the
+    v12 full-sample quantile used future information.
   - M-5 fix: seeded RNG -> reproducible cost simulation.
 
   VALIDATION
   - PSR + DSR (Bailey & Lopez de Prado) printed for every config;
     DSR benchmark = expected max Sharpe over N_TRIALS tried configurations.
+    WHY: a Sharpe point estimate assumes normal returns and a single trial.
+    PSR reports the probability that true SR > 0 given skew/kurtosis and
+    finite n; DSR additionally deflates for selection bias — after 13
+    versions of iteration, a backtest that cannot beat the expected max of
+    N_TRIALS null strategies (DSR 0.11 here) is a hypothesis, not an edge.
+    PSR 修正非正态+有限样本；DSR 再扣除多重尝试的选择偏差。DSR 0.11 =
+    尚不能与 "N 次尝试里挑出来的运气" 区分——模拟盘才是最终裁判。
 
   TRAINING
-  - M-13 fix: purge gap (seq_len + LABEL_H) between train tail and val slice.
+  - M-13 fix: purge gap (seq_len + LABEL_H) between train tail and val
+    slice — adjacent val overlapped train labels, making early stopping
+    slightly optimistic.
   - Turnover penalty kept from v12 (lambda=0.1, arXiv:2509.04541 motivates
     band-style turnover regularization).
+
+  STATUS (2026-07-13, honest note / 诚实现状注记)
+  - The extended-window research (RESEARCH_2026-07-13_extended_window.md)
+    showed this backtest edge did NOT generalize: on 2021-2026 the same
+    recipe loses -64%, and a controlled rerun of THIS window minus the 4
+    late-listed high-vol alts (APT/ARB/OP/SUI) flips +32.6% to -13.6%.
+    The ranking signal (IC) is positive in every year, but the top-K TAIL
+    monetization is fragile — v13's headline number is best read as one
+    good year (2025) + tail trades on four lucky names + selection across
+    ~70 trials (exactly what DSR 0.11 was warning about).
+  - v13 nevertheless REMAINS the live paper-trading CONTROL track until
+    the pre-registered September gate (ROADMAP_2026-07-13.md): the gate
+    criteria were frozen in advance precisely so that new offline evidence
+    cannot quietly terminate the experiment early.
+  - 扩窗研究表明本回测优势不能泛化（尾部变现脆弱：全周期 -64%，同窗剔除
+    4 个晚上市山寨即 +32.6% 翻 -13.6%）。v13 仍作为线上对照 track 跑到
+    9 月预注册 gate——判据提前冻结，不因离线新证据提前中止实验。
 """
 from __future__ import annotations
 
@@ -90,6 +127,9 @@ EXIT_BAND: int = 6         # exit long slot only if rank >= EXIT_BAND / 退出�
 LAMBDA_TURNOVER: float = 0.1
 VOL_QUANTILE: float = 0.15
 N_TRIALS_DSR: int = 50     # honest-ish count of configs tried across v1..v13 / 历史尝试配置数
+                           # (frozen here for reproducibility of the v13 report; the live count
+                           # now grows in trials.json via tools/validation_stats.register_trial
+                           # — 本处冻结以复现 v13 报告，后续试验数以 trials.json 登记表为准)
 
 
 # ============================================================================
@@ -356,9 +396,13 @@ def run_backtest(
     total_cost = 0.0
     rebalances = 0
     slot_trades = 0
-    hc = 10 ** 9  # bars since last change / 距上次换仓bar数
+    hc = 10 ** 9  # bars since last change; init huge so the first decision may trade
+                  # 距上次换仓bar数（初始化为极大值=首次决策必可交易）
 
     def slot_cost(asset: int, t: int, notional: float, side: str) -> float:
+        # M-6: TWAP cost priced on THIS asset's own forward closes — v11/v12
+        # priced every leg off the long leg's path, mis-stating slippage.
+        # M-6：成本按该资产自身的未来价格路径计算（旧版全部腿共用多头路径）。
         di = t + seq_len - 1                      # decision close index
         ep = close_np[di, asset]
         fu = [close_np[min(di + 1 + j, T_full - 1), asset] for j in range(4)]
@@ -405,6 +449,9 @@ def run_backtest(
         total_cost += cost_bar
 
         ret = pnl - cost_bar / max(equity, 1.0)
+        # clip pathological single-bar PnL (data-glitch guard; replicated
+        # bit-for-bit by the second engine's E1 replica in crosscheck)
+        # 单bar收益±10%截断（数据毛刺保护；第二引擎复刻件按同口径实现）
         ret = max(min(ret, 0.10), -0.10)
         equity *= (1.0 + ret)
         eq_curve.append(equity)

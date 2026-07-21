@@ -19,7 +19,26 @@ Rules (per the user specification):
   4. Taker fallback: if not filled after 3 bars, convert to taker order
      with full taker fee
 
+WHY this module exists — the v5 "fill illusion" (README version history):
+v4's Sharpe 1.38 assumed every limit order filled at the desired price.
+Real fills are asymmetric — you get filled precisely when you don't want
+to be.  Modeling that asymmetry collapsed the fake edge (v5 lost 48% to
+friction) and forced the move to low-frequency TWAP execution in v6.
+This class is the original v5 single-order mechanism; the v13 result path
+applies the same per-slice asymmetry inside engine/twap_executor.py.
+
+Reproducibility note (REVIEW_2026-06-10.md M-5): uses module-level `random`
+with no internal seed — deterministic runs require the CALLER to seed
+(the v13 run scripts do).
+
 逆向选择微观执行模拟器。
+
+为什么存在——v5 的"成交幻觉"（见 README 版本史）：v4 的 Sharpe 1.38 假设
+限价单总能按理想价成交；真实成交是不对称的——恰恰在你不想成交时才成交。
+把该不对称建模后假 edge 消失（v5 被摩擦吃掉 48%），催生 v6 低频+TWAP。
+本类是 v5 原始的单笔订单机制；v13 出结果路径在 twap_executor.py 中按切片
+应用同一不对称。可复现性注（M-5）：内部用未播种的 random，调用方需自行
+设置种子（v13 run 脚本已做）。
 
 模拟实盘中限价单执行的现实情况：
   - 排队延迟：订单不会立即成交，需在队列中等待

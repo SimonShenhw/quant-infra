@@ -1,16 +1,27 @@
 """
-Live rank IC from paper-trading logs.
+Live cross-sectional rank IC from paper-trading logs.
 从模拟盘日志计算 live 全截面 rank IC。
 
-Requires daily_signals.all_closes (logged from 2026-06-10 onward by the
-upgraded run_paper_daily.py). For each pair of consecutive logged days,
-computes the Spearman rank correlation between day-t scores and the
-day-t -> day-t+1 realized returns across all 20 assets, i.e. the live
-counterpart of the backtest's OOS rank IC.
+WHY THIS TOOL (AND all_closes) EXISTS: the 2026-06-10 paper-trading review
+(REVIEW_2026-06-10.md section 4 / 第④节) found the old daily_signals schema
+only logged the two traded assets' closes, so the live counterpart of the
+backtest's OOS rank IC (0.064) was IMPOSSIBLE to compute — the one number
+that could confirm or falsify the backtest edge was simply never recorded,
+and 6 weeks of live data could only say "indistinguishable from random".
+run_paper_daily.py has logged the full 20-asset close vector
+(daily_signals.all_closes JSON) since 2026-06-10 precisely to close that
+gap; this script is its consumer. The pre-registered September v13 gate
+("live IC > 0", ROADMAP_2026-07-13.md) is judged on this output.
 
-需要 daily_signals.all_closes 列（升级版 run_paper_daily.py 自 2026-06-10
-起记录）。对每对相邻记录日，计算 t 日打分与 t→t+1 实现收益的横截面
-Spearman 相关——即回测 OOS rank IC 的 live 对应物。
+WHAT: for each pair of consecutive logged days, the Spearman rank
+correlation between day-t scores and day-t -> day-t+1 realized returns
+across all assets — the live analogue of the backtest OOS rank IC.
+Estimates are noisy below ~60 days; the t-stat is printed alongside.
+
+原因：2026-06-10 审查发现旧 schema 每天只记多空两个资产的收盘价，live
+全截面 rank IC 根本算不出来——唯一能证实/证伪回测优势的数字压根没被记录。
+升级版 run_paper_daily.py 自当日起记录全部 20 资产收盘价（all_closes），
+本工具是其消费端；v13 九月预注册 gate 的 "live IC > 0" 判据即看此输出。
 
 Usage: python tools/paper_live_ic.py
 """
@@ -56,6 +67,11 @@ def main():
         sys.exit(0)
 
     ics = []
+    # gap_d is printed because run days were historically irregular (1-6 day
+    # gaps pre-2026-06-11 scheduler); a multi-day gap means the "next-day"
+    # return actually spans several days — read those ICs with care.
+    # gap_d 提示相邻记录日间隔：调度器上线前运行不规律，跨多日的"次日"收益
+    # 实为多日收益，对应 IC 需谨慎解读。
     print(f"{'date_t':<12} {'date_t+1':<12} {'n_assets':>8} {'rank_IC':>9} {'gap_d':>6}")
     print("-" * 52)
     for (d0, s0, c0), (d1, _, c1) in zip(rows[:-1], rows[1:]):

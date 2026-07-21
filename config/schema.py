@@ -4,6 +4,28 @@ Config schema — all backtest hyperparameters in typed dataclasses.
 
 Replaces hardcoded values scattered across 9 run_*.py files.
 替代散落在 9 个 run_*.py 文件中的硬编码值。
+
+WHY typed dataclasses instead of a raw YAML dict: fail-fast on config
+typos. With dict soup, `cfg["purge_bras"]` or a string where a float
+belongs surfaces as a silent KeyError/behavior change deep inside a
+multi-hour run; dacite's `from_dict` (see config/__init__.py) validates
+field names AND types at load time, IDEs autocomplete the fields, and
+defaults live in exactly one place per knob.
+为什么用类型化 dataclass 而非裸 YAML 字典：配置手滑立刻炸。字典汤里
+`cfg["purge_bras"]` 或该是 float 的地方给了字符串，会在跑了几个小时的
+任务深处才以 KeyError/静默行为变化暴露；dacite 的 `from_dict`
+（见 config/__init__.py）在加载时同时校验字段名和类型，IDE 可自动补全，
+每个旋钮的默认值只存在一处。
+
+STATUS — honest scope note: this is v10-era infrastructure (defaults mirror
+run_v10_cpcv.py; the default factor_list is the old 10-factor set). The
+current v13+ run scripts and paper trading define their hyperparameters as
+module-level constants and do NOT consume this package — checkpoints, not
+YAML, carry the authoritative factor list forward.
+状态——如实说明：这是 v10 时期的基础设施（默认值对应 run_v10_cpcv.py，
+默认 factor_list 还是旧的 10 因子集）。当前 v13+ 运行脚本与模拟盘把超参
+定义为模块级常量，并不消费本包——向前传递权威因子清单的是 checkpoint，
+不是 YAML。
 """
 from __future__ import annotations
 

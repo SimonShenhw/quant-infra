@@ -2,23 +2,56 @@
 Rank-weighted full-book vs banded top-K on the 2021-2026 OOS predictions.
 连续排名加权全簿 vs banded top-K（扩窗 OOS 预测，v14 变现层实验）。
 
-Motivation (RESEARCH_2026-07-13_extended_window.md): the ranking signal is
+HYPOTHESIS (RESEARCH_2026-07-13_extended_window.md): the ranking signal is
 robust across the full cycle (IC +0.076, every year positive) but top-3
-tails lose -64% — the model's information lives in the MID-BOOK ranking,
-not the extremes. Test the constructions the literature queued for exactly
-this situation (Garleanu-Pedersen partial trading toward a rank-weighted
-aim portfolio):
+tails lose -64% — so maybe the model's information lives in the MID-BOOK
+ranking, not the extremes, and a construction that trades the whole book
+can monetize it.
+
+METHOD: test the constructions the literature queued for exactly this
+situation (Garleanu-Pedersen partial trading toward a rank-weighted aim
+portfolio), plus vol-scaled variants:
 
   A  banded top3/bottom3 (baseline, flat-cost re-run of the -64% strategy)
   B  rank-weighted full book: w_i propto (mean_rank - rank_i), gross 1.0
   C  B + GP partial trading tau=1/3  (move 1/3 toward the aim each day)
   D  B + GP partial trading tau=1/5
+  E  B + inverse-vol scaling (risk-parity across names)
+  F  E + GP partial trading tau=1/5
 
 Same OOS predictions (rebuilt from checkpoints/folds_ext_full with the
 n_samples fingerprint check), same daily decision cadence, same H-1 timing
 (weights effective next bar), same FLAT 8 bps/side turnover cost for every
-variant (the conservative cross-checked quote) + gross (cost-free) numbers
-for decomposition. Registers 4 trials.
+variant (the conservative cross-checked quote — why flat: removes the
+stochastic TWAP model as a confound between constructions) + a cost-free
+w.y24 diagnostic for decomposition. Registers 6 trials.
+
+VERDICT (2026-07-13, same doc): hypothesis REFUTED — NO linear monetization
+survives. A -67.8%, B (full book) -82.0% i.e. WORSE than the tails, best
+smoothed variant F still -31.8%; every construction negative. The decisive
+number is the w.y24 diagnostic (24h label-aligned gross alpha, no costs,
+no path effects): rank weights -0.033%/day, vol-scaled -0.009%/day — BOTH
+negative while Spearman IC is positive in all six years. That contradiction
+is the diagnosis: the model wins in RANK space but loses in DOLLAR space —
+it orders the many small-magnitude pairs correctly (which is what carries
+IC) yet systematically puts the few LARGE-magnitude names on the wrong side
+(shorting explosive winners, longing crashers). With crypto's fat right
+tail, rank-space pennies never cover dollar-space losses. Conclusion: this
+is not a portfolio-construction problem but a TRAINING-OBJECTIVE problem —
+ListMLE optimizes rank order and delivered exactly that; the deliverable
+just doesn't monetize. Construction iteration was therefore STOPPED (~70
+trials — further picking would be pure selection bias) and the follow-up
+moved to magnitude-aware objectives (research_objectives.py).
+
+结论：假设被证伪——没有任何线性变现方式在全周期存活（B 全簿 -82% 比尾部
+更差，最好的 F 也只是少亏 -31.8%）。决定性诊断是 w·y24（24h 对齐、无成本
+无路径效应的毛 alpha）：rank 权重 -0.033%/天、vol 缩放 -0.009%/天——在
+六年 IC 全正的同时双双为负。矛盾的解释即诊断本身：模型在 rank 空间赢
+（排对大量小幅度名字对）、在美元空间输（系统性把大行情名字放错边——做空
+暴涨币、做多暴跌币）；crypto 右偏肥尾下，rank 空间的小钱盖不住美元空间的
+大亏。这不是组合构建问题，是训练目标问题：ListMLE 交付了它被要求的排序，
+而排序本身不变现。构建层迭代就此打住（试验数已 ~70，再挑就是纯选择偏差），
+后续转向 magnitude-aware 目标（research_objectives.py）。
 """
 from __future__ import annotations
 
@@ -208,9 +241,14 @@ def main():
     inv_vol = trailing_inv_vol(r1h)
 
     # -- decisive diagnostic: 24h label-aligned GROSS alpha of each weighting,
-    #    no path/timing effects. IC>0 with this negative = the rank info does
-    #    not survive translation into return space (vol corruption).
-    # -- 关键诊断：w·y24 的 24h 对齐毛alpha（无路径效应）。
+    #    no path/timing effects. WHY it is decisive: it removes costs, GP
+    #    smoothing and compounding from the equation, leaving only "does this
+    #    weighting covary positively with raw returns". IC>0 while this is
+    #    negative = the rank info does not survive translation into dollar
+    #    space — which is exactly what the run found (-0.033%/day).
+    # -- 关键诊断：w·y24 的 24h 对齐毛 alpha（无成本、无平滑、无路径效应），
+    #    只回答"该权重与原始收益的协方差是否为正"。IC 为正而它为负 =
+    #    排序信息无法翻译进美元空间——本次运行的实际结论。
     yrs = (bar_ms // 1000).astype("datetime64[s]").astype("datetime64[Y]").astype(int) + 1970
     print(f"\n  gross 24h-aligned alpha (w·y24, %/day, NO costs):")
     print(f"  {'weighting':<16}" + " ".join(f"{y:>8}" for y in sorted(set(yrs))) + f" {'ALL':>8}")

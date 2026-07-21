@@ -14,6 +14,22 @@ Free metrics include:
 These are SLOW-MOVING (daily granularity), good for regime detection
 not 1h trading. Use as state features.
 
+HYPOTHESIS: on-chain activity (addresses, transfers, valuation ratios) is
+orthogonal to price/volume factors — it measures network usage rather than
+exchange flow, so it could gate WHICH regime the price-based signal should
+trade in, not generate 1h alpha itself.
+经济假设：链上活动（地址数、转账量、估值比率）与价格/成交量因子正交——
+度量的是网络使用而非交易所资金流，适合判定价格信号该在哪种 regime 下开仓，
+而非自己产生 1h alpha。
+
+STATUS — honest scope note: research/data-collection infrastructure from
+the v11.2 alternative-data sweep. Not imported by any pipeline — no factor
+consumes onchain.db, and it plays no part in the v13+ result path. Kept as
+groundwork for future regime-feature research.
+状态——如实说明：v11.2 另类数据尝试遗留的研究/采集基础设施。无任何管线
+导入——没有因子消费 onchain.db，也不参与 v13+ 结果路径。保留作未来
+regime 特征研究的地基。
+
 这些指标更新慢（日级），适合做 regime 识别而非1h交易。作为状态特征使用。
 """
 from __future__ import annotations

@@ -2,26 +2,58 @@
 Magnitude-aware training objectives — the model sleeve's LAST SHOT.
 magnitude-aware 训练目标——模型 sleeve 的最后一搏。(v14 option b)
 
-Diagnosis being tested (RESEARCH_2026-07-13_extended_window.md): ListMLE
-delivers rank order; the model wins in rank space (IC + every year) but
-loses in dollar space (w.y24 < 0) because large-magnitude names end up on
-the wrong side. If magnitude-aware objectives cannot flip dollar-space
-alpha positive, the model sleeve retires and v14 goes carry-backbone.
+HYPOTHESIS (diagnosis from research_rank_weighted.py /
+RESEARCH_2026-07-13_extended_window.md): ListMLE delivers rank order; the
+model wins in rank space (IC positive every year) but loses in dollar
+space (w.y24 < 0) because large-magnitude names end up on the wrong side.
+If the failure really is the training objective — not the signal — then
+writing MAGNITUDE into the loss should flip dollar-space alpha positive.
+If no magnitude-aware objective can, the model sleeve retires and v14 goes
+carry-backbone.
 
-Objectives (same FULL 2021-2026 window, 16 symbols, 18 factors, same CPCV,
-same turnover-penalty mechanics as v13):
+METHOD (same FULL 2021-2026 window, 16 symbols, 18 factors, same CPCV,
+same turnover-penalty mechanics as v13 — only the loss changes, so any
+outcome difference is attributable to the objective):
   O1 volnorm_mse   MSE on z = y24 / vol24 (vol-normalized 24h return)
   O2 pair_magwt    pairwise logistic ranking weighted by |z_i - z_j|
                    (big spreads dominate the loss)
   O3 softport      differentiable portfolio: maximize w(s).z with
                    w = demeaned scores / gross
 
-PRE-REGISTERED PASS GATE (per objective, decided before running):
+PRE-REGISTERED PASS GATE (per objective, decided before running — why:
+after ~70 registered trials, only a gate frozen in advance keeps this from
+being one more selection-bias pick):
   1. OOS w.y24 (score-proportional demeaned weights, label-aligned gross,
      no costs) > 0 overall, AND
   2. positive in >= 4 of 6 calendar years, AND
   3. flat-8bps GP-smoothed (tau=1/5) backtest Sharpe > 0.
 No objective passes => model sleeve retires. Trials are registered.
+
+VERDICT (2026-07-13, 3x H200): the diagnosis is CONFIRMED — putting
+magnitude into the objective flips dollar-space alpha positive over the
+full cycle. O1 FAIL (3/6 positive years); O2 PASS (w.y24 +0.060bp/d, 5/6
+years positive, backtest +4.6% Sharpe 0.14); O3 PASS (+0.102bp/d, 4/6,
++26.4% Sharpe 0.39, PSR 0.81). The price was exactly as predicted: rank IC
+fell from 0.076 to 0.01-0.03 — the model traded worthless rank-space
+performance for monetizable dollar-space performance (contrast: ListMLE's
+six constructions all landed -32%..-82%). The pre-registered follow-up
+ablation (O2O3Combined, lam in {0.01,0.03,0.1}) scanned monotonically
+toward O2; M010 posted the highest Sharpe (0.75, PSR 0.96) but front-loaded
+in 2021-22 and NEGATIVE in 2026 — so by the pre-registered selection rule
+(most positive years first, Sharpe as tie-break) the v14 model sleeve is
+the O2 endpoint (5/6 years, the only variant positive in 2026); see
+train_o2_production.py. All runs honestly registered (n_trials ~77);
+PSR 0.62-0.96 still not DSR-significant — live tracks are the arbiter.
+
+结论：诊断被证实——把幅度写进训练目标后，美元空间 alpha 全周期转正。
+O1 FAIL（3/6 年）；O2 PASS（+0.060bp/天，5/6 年为正，回测 +4.6%）；
+O3 PASS（+0.102bp/天，4/6 年，+26.4%，PSR 0.81）。代价如预期：rank IC 从
+0.076 掉到 0.01-0.03——模型放弃不值钱的 rank 空间性能，换来值钱的美元
+空间性能（对照 ListMLE 六种构建 -32%~-82%）。后续 O2/O3 混合消融的 λ 扫描
+单调指向 O2；M010 Sharpe 0.75 最高但高度前置于 2021-22、2026 年为负——
+按预注册选择规则（正年份数优先、Sharpe 破平），v14 模型 sleeve = O2
+（5/6 年为正、唯一在 2026 为正），见 train_o2_production.py。全部试验
+如实登记（n_trials≈77）；PSR 仍非 DSR 意义显著，live 三账本才是裁判。
 
 Run (HPC): python tools/research_objectives.py --obj O1|O2|O3
 """
@@ -132,6 +164,9 @@ def trailing_vol24(r1h: np.ndarray) -> np.ndarray:
         out[t] = np.sqrt(np.maximum(v, 1e-12)) * np.sqrt(24)
     med = np.nanmedian(out[VOL_WINDOW:])
     out[:VOL_WINDOW] = med  # warmup rows get a neutral scale / 预热期用中位数
+    # Floor at med*0.25: caps z = y24/vol at ~4x median leverage so a quiet
+    # coin's tiny vol cannot explode its normalized label (and the loss).
+    # 波动率下限=中位数×0.25：防止低波动币的 z 标签被除爆、主导损失。
     return np.maximum(out, med * 0.25)
 
 

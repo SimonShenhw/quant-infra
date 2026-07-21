@@ -1,13 +1,51 @@
 """
-Feature Engineering — computes technical factors from OHLCV data.
+Feature Engineering — causal factor primitives + the legacy v2 pipeline.
 
 ALL normalisation is strictly causal (rolling-window only, no future info).
 No global statistics. No look-ahead padding.
 
-特征工程 — 从OHLCV数据计算技术因子。
+WHY the paranoia about causality — v1's very first data-leakage bug was a
+GLOBAL z-score: normalising each factor with full-sample mean/std leaked
+future statistics into every training sample and produced a fake MSE of
+1e-6 (README v2 history).  Every primitive here is therefore built to use
+only data at or before t:
+  - compute_sma / _rolling_std: conv1d LEFT-padded with the series' FIRST
+    value — padding with a past-known constant instead of zeros/replicate
+    avoids both future leakage and artificial scale jumps at the boundary;
+  - compute_ema: plain recursive scan, causal by construction;
+  - _rolling_std: single-pass E[x²] − E[x]² (clamped ≥ 0 against
+    floating-point negatives) instead of a windowed two-pass;
+  - _rolling_zscore: trailing-window mean/std only.
+
+Causality is ENFORCED, not just promised: invariant test t2
+(tests/run_invariants.py) scrambles all data after t and asserts factors
+at ≤ t are bit-identical.  Run it before touching anything here.
+
+Status — two lives in one file: the primitives (compute_sma, compute_ema,
+_rolling_std, _rolling_zscore, compute_rsi, ...) ARE in the current
+result path, imported by the factors/ plugin library that feeds v13 and
+the paper tracks.  `build_factor_tensor` (the fixed 10-factor pipeline at
+the bottom) is the LEGACY v2-era path — used by main.py, run_btc_oos.py,
+run_v5–v10 and the legacy paper_trading engine; v11+ builds factors via
+FactorRegistry instead.
+
+特征工程——因果因子原语 + 遗留 v2 管线。
 
 所有标准化严格因果（仅使用滚动窗口，无未来信息）。
 无全局统计量。无前瞻性填充。
+
+为什么对因果性如此偏执——v1 的第一个数据泄露 bug 就是全局 z-score：
+用全样本均值/标准差归一化把未来统计量漏进每个训练样本，造出 1e-6 的
+假 MSE（README v2 版本史）。因此每个原语都只用 t 及之前的数据：
+conv SMA 用序列首值做左填充（已知的过去常数，避免泄露也避免边界尺度
+跳变）；EMA 是递归扫描；滚动标准差用单遍 E[x²]−E[x]²（clamp≥0 防浮点
+负数）；z-score 只用尾部窗口。因果性由不变量测试 t2
+（tests/run_invariants.py）强制执行：打乱 t 之后的数据，断言 ≤t 的
+因子逐位不变——改动本文件前必跑。
+
+状态——一个文件两种身份：原语函数在当前出结果路径上（factors/ 插件库
+导入并供 v13 与模拟盘使用）；`build_factor_tensor`（文件底部的固定
+10 因子管线）是遗留 v2 路径，v11+ 改经 FactorRegistry 构建因子。
 """
 from __future__ import annotations
 
@@ -46,7 +84,16 @@ def compute_log_returns(close: Tensor) -> Tensor:
 def compute_sma(series: Tensor, window: int) -> Tensor:
     """Simple Moving Average — causal only (left-pad with first value).
 
-    简单移动平均 — 仅因果（左填充首值）。
+    Implementation note: conv1d with a uniform kernel after left-padding
+    `window-1` copies of series[0].  The first-value pad (vs zero pad)
+    keeps early outputs on the series' own scale, so downstream ratios
+    like close/sma stay ≈1 instead of exploding during warm-up; the pad
+    value is known at t=0, so no future information enters.
+
+    简单移动平均 — 仅因果（左填充首值）。实现：左补 window-1 个 series[0]
+    后做均匀核 conv1d。用首值（而非零）填充使暖机期输出保持在序列自身
+    量级，下游 close/sma 之类的比率约为 1 而不会爆炸；填充值在 t=0 已知，
+    不引入未来信息。
     """
     kernel: Tensor = torch.ones(
         1, 1, window, device=series.device, dtype=series.dtype
@@ -62,7 +109,15 @@ def compute_sma(series: Tensor, window: int) -> Tensor:
 def _rolling_std(series: Tensor, window: int) -> Tensor:
     """Causal rolling standard deviation using conv1d (E[x^2] - E[x]^2).
 
+    One-pass variance identity: two uniform convolutions give rolling
+    E[x] and E[x²]; var = E[x²] − E[x]² can go slightly negative from
+    floating-point cancellation, hence the clamp(min=0) before sqrt.
+    Same first-value left-pad as compute_sma keeps it causal.
+
     因果滚动标准差，使用conv1d实现（E[x^2] - E[x]^2）。
+    单遍方差恒等式：两次均匀卷积得到滚动 E[x] 与 E[x²]；浮点相消可能
+    使 var 轻微为负，故 sqrt 前 clamp(min=0)。左填充首值方式与
+    compute_sma 相同，保持因果。
     """
     first_val: Tensor = series[0].expand(window - 1)
     padded: Tensor = torch.cat([first_val, series])
@@ -79,7 +134,12 @@ def _rolling_std(series: Tensor, window: int) -> Tensor:
 def compute_ema(series: Tensor, span: int) -> Tensor:
     """Exponential Moving Average — strictly causal recursive scan.
 
-    指数移动平均 — 严格因果递归扫描。
+    ema[t] = alpha*x[t] + (1-alpha)*ema[t-1], alpha = 2/(span+1), seeded
+    with x[0].  The recursion is inherently sequential, so it runs on CPU
+    in a Python loop (acceptable: computed once per series, then cached).
+
+    指数移动平均 — 严格因果递归扫描。alpha = 2/(span+1)，以 x[0] 起始。
+    递归天然串行，故在 CPU 上循环计算（可接受：每条序列只算一次并缓存）。
     """
     alpha: float = 2.0 / (span + 1)
     s: Tensor = series.detach().cpu()

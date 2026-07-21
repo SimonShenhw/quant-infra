@@ -8,12 +8,26 @@ References:
 
 PSR answers: given non-normal returns and finite sample, what is the
 probability that the TRUE Sharpe exceeds a benchmark SR*?
+WHY PSR: a point-estimate Sharpe implicitly assumes normal iid returns and
+ignores estimation error. Crypto hourly PnL is skewed and fat-tailed, and
+our samples are finite — both inflate the sampling error of SR itself.
+PSR folds skewness and kurtosis into SR's standard error and turns the
+naked ratio into a calibrated probability statement.
+
 DSR sets SR* to the expected maximum Sharpe under N independent trials
 (selection bias correction), so DSR < 0.95 means the observed Sharpe is
 not distinguishable from the best of N random strategies.
+WHY DSR: 13 versions of iteration = many implicit trials. Under the null
+of zero true skill, the expected MAXIMUM Sharpe across n_trials grows with
+n_trials, so the best backtest found is biased upward simply by having
+been selected. CPCV cannot control this researcher-degrees-of-freedom
+effect — only an honest trial count can.
 
-PSR 回答：给定非正态收益与有限样本，真实 Sharpe 超过基准 SR* 的概率。
-DSR 将 SR* 设为 N 次独立试验下的期望最大 Sharpe（修正选择偏差）。
+PSR 回答：给定非正态收益与有限样本，真实 Sharpe 超过基准 SR* 的概率——
+把偏度/峰度计入 SR 自身的标准误，将"裸夏普"变成有校准的概率陈述。
+DSR 将 SR* 抬高到 n_trials 次独立试验下的期望最大（虚假）Sharpe（修正
+"挑最好那次"的选择偏差）；13 个版本的迭代就是大量隐性试验，CPCV 管不住
+研究者自由度，只有如实计数试验次数才管得住。
 """
 from __future__ import annotations
 

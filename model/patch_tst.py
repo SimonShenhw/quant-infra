@@ -10,6 +10,13 @@ Outperforms vanilla Transformer on financial time series by 10-15%.
 在金融时序上比朴素 Transformer 强 10-15%。
 
 Adapted to our 4D cross-asset architecture: [Batch, Assets, Seq, Features].
+
+STATUS (honest note): evaluated during the v11.2 feature sweep as an
+alternative backbone; the GRU + cross-asset attention model remained the
+production choice. NOT in the current result path — kept as a research
+alternative for future backbone ablations.
+现状注记：v11.2 优化扫描中评估过的备选骨干，未被选为生产模型；不在当前
+结果路径上，留作未来骨干消融的备选。
 """
 from __future__ import annotations
 

@@ -4,6 +4,24 @@ Concurrent data pipeline via CCXT sync + ThreadPoolExecutor.
 Fetches 30+ crypto pairs × 1 month of 5m klines with pagination.
 Stores in SQLite. Uses sync CCXT (which handles geo-restrictions internally).
 
+STATUS — honest scope note: this is the v5-v7-era ingestion path
+(market_data.db, consumed by run_v5_final / run_v6_lowfreq / run_v7_wfo).
+The current v13+ result path trains from the Binance Vision parquet lake
+(archive_downloader + lake_loader) instead. Kept because CCXT-via-OKX works
+where data.binance.vision is geo-blocked, making it the fallback ingestion
+route (see README Quick Start).
+状态——如实说明适用范围：这是 v5-v7 时代的采集路径（market_data.db，由
+run_v5_final / run_v6_lowfreq / run_v7_wfo 消费）。当前 v13+ 结果路径改从
+Binance Vision parquet 数据湖训练（archive_downloader + lake_loader）。
+保留原因：data.binance.vision 被地域封锁时，经 OKX 的 CCXT 通道仍可用，
+是采集的兜底路线（见 README 快速开始）。
+
+WHY sync CCXT + threads (not asyncio): ccxt's sync client transparently
+handles per-exchange rate limits and geo quirks; with only 3 workers the
+bottleneck is the exchange rate limit, not Python threads.
+为什么用同步 CCXT + 线程而非 asyncio：ccxt 同步客户端透明处理各所限速与
+地域问题；只开 3 个 worker 时瓶颈在交易所限速，不在 Python 线程。
+
 基于CCXT同步接口 + ThreadPoolExecutor的并发数据管道。
 
 获取30+加密货币交易对 × 1个月的5分钟K线（含分页）。

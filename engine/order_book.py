@@ -4,10 +4,23 @@ Limit Order Book (LOB) and Matching Engine.
 Implements a price-time priority matching engine with full order book
 depth tracking.  Supports LIMIT and MARKET orders with partial fills.
 
+HONESTY NOTE — legacy/demonstration layer, NOT in the current result path:
+the published v11+ numbers use the TWAP adverse-selection cost model in the
+run scripts, not this matching engine.  Known documented issue kept as-is:
+  - M-11: asset class (crypto vs A-share fee schedule) is inferred from a
+    `price > 500` heuristic rather than explicit metadata, and seed_from_bar
+    rounds prices to 2 decimals, which collapses book levels for low-priced
+    coins.  Documented, not fixed — see REVIEW_2026-06-10.md M-11.
+
 限价订单簿 (LOB) 与撮合引擎。
 
 实现价格-时间优先的撮合引擎，支持完整订单簿深度追踪。
 支持限价单和市价单，含部分成交。
+
+诚实披露：遗留/演示层，不在 v11+ 出结果路径上（已发布数字走 run 脚本中的
+TWAP 逆向选择成本模型）。已知问题 M-11：用 price>500 启发式区分加密货币/
+A股费率、seed_from_bar 按 0.01 取整导致低价币盘口塌缩——如实记录、未修复。
+见 REVIEW_2026-06-10.md M-11。
 """
 from __future__ import annotations
 
@@ -253,6 +266,12 @@ class OrderBook:
             )
 
             # Adaptive transaction costs by asset class / 按资产类别自适应交易成本
+            # HONESTY NOTE (M-11): asset class is guessed from price>500 — a
+            # heuristic, not metadata; it misclassifies cheap crypto and
+            # expensive A-shares. Documented, not fixed (module is not in the
+            # result path). See REVIEW_2026-06-10.md M-11.
+            # 诚实披露（M-11）：按 price>500 猜资产类别——启发式而非元数据，
+            # 低价币/高价A股会被错分。如实记录、未修复（不在出结果路径上）。
             notional: float = match_price * match_qty
             commission: float
             total_slippage: float
@@ -387,6 +406,9 @@ class MatchingEngine:
         available_qty: float = max(volume * 0.1, 1.0)  # 10% of bar volume / K线成交量的10%
 
         for i in range(1, 6):
+            # M-11: rounding to 2 decimals collapses distinct levels into one
+            # for sub-$1 coins (spread of a $0.5 coin is ~$0.0001). Documented,
+            # not fixed. / M-11：0.01 取整让低价币的多个盘口档位塌缩成同一价。
             bid_price: float = round(close_price - spread * i, 2)
             ask_price: float = round(close_price + spread * i, 2)
             level_qty: float = available_qty / (i * 2)

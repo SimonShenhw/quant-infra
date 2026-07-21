@@ -1,3 +1,15 @@
+# ============================================================================
+# HISTORICAL ARTIFACT / 历史存档 - legacy realtime engine - superseded by run_paper_daily.py
+# Kept as project record. Results produced before the C-1 ms->us timestamp
+# fix (2026-06-10) are unreliable as published; the current pipeline is
+# run_v13_final.py (research) + run_paper_daily.py (live).
+# See REVIEW_2026-06-10.md for the full audit trail.
+# 保留作为项目演进记录；C-1 时间戳修复(2026-06-10)之前产出的结果不可作为
+# 依据；当前管线见 run_v13_final.py 与 run_paper_daily.py。
+# EXTRA (REVIEW M-8): builds the old 10-factor tensor (incompatible with
+# 17/19-factor ckpts) and accumulates costs WITHOUT deducting them from
+# equity. 额外(M-8)：旧 10 因子、成本只累计不扣减——不可用于记账。
+# ============================================================================
 """
 Paper Trading Engine — real-time inference + simulated execution.
 模拟盘引擎 — 实时推理 + 模拟执行。

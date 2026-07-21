@@ -2,19 +2,42 @@
 Regime-conditioned IC analysis of the v13 OOS predictions (ROADMAP Phase 2.2).
 v13 OOS 预测的 regime 条件 IC 分析。
 
-Buckets every decision point by:
+HYPOTHESIS (from RESEARCH_2026-07-02.md): v13's backtest alpha is
+short-leg concentrated and BEAR-REGIME dependent — i.e. the short leg only
+worked because the 2024-09..2026-03 window was mostly a falling market, and
+the live June-2026 bleeding (shorting strong coins in an up-market) is that
+artifact surfacing. If true, short-leg alpha should collapse in the
+up-trend bucket.
+
+METHOD: bucket every decision point by
   - TREND: BTC close vs its causal 200d (4800-bar) SMA  -> up / down
     (also 100d for coverage on the shorter history)
   - VOL:   30d realized vol of the EW basket -> full-sample terciles
     (diagnostic bucketing, NOT a tradeable rule — noted in output)
+and report per bucket: OOS ensemble rank IC vs the 24h label, LONG-leg
+alpha (model top-3 minus EW basket, 24h fwd), SHORT-leg alpha (EW basket
+minus model bottom-3). WHY leg alphas and not just IC: IC measures the
+whole ranking; the baskets only trade the tails, so the legs can die while
+IC survives.
 
-Per bucket reports:
-  - OOS ensemble rank IC vs the 24h label
-  - LONG-leg alpha:  mean 24h fwd return of model top-3 minus EW basket
-  - SHORT-leg alpha: EW basket minus model bottom-3
-This directly tests the 2026-07-02 hypothesis that v13's backtest alpha is
-short-leg concentrated and bear-regime dependent.
-直接检验"空头腿 alpha = 熊市伪影"假设。
+VERDICT (2026-07-13, appendix of RESEARCH_2026-07-02.md): hypothesis
+REJECTED within this window — short-leg alpha in the UP-regime (+0.138%/24h)
+is NOT lower than in the down-regime (+0.095%), and rank IC is positive in
+every bucket (ALL +0.064). In-window, the short alpha is fine in up-markets.
+That leaves only two candidate explanations for the live divergence: (1) the
+specific June-July 2026 regime (broad alt rally) has NO representative
+sample inside the 19-month window — which made the 2021+ extended-window
+retrain (research_extended_window.py) the key evidence line, and indeed the
+tail-level regime dependence only became visible there; (2) unmodeled live
+frictions. Note IC_t already deflates effective N by 24 for the overlapping
+24h labels.
+
+结论：「空头腿 alpha = 熊市伪影」假设在本窗口内不成立——上涨 regime 的
+空头 alpha（+0.138%/24h）不低于下跌 regime（+0.095%），各桶 IC 全为正。
+live 亏损的解释只剩：① 2026 年 6-7 月的山寨普涨结构在 19 个月窗口内没有
+代表性样本（由此把扩窗重训定为关键证据线，后来尾部层面的 regime 依赖
+确实只在 2021 入窗后才现形）；② 回测未建模的 live 摩擦。IC_t 已按 24h
+标签重叠把有效样本数缩减 24 倍。
 
 Registers itself in trials.json (one trial).
 """
@@ -111,7 +134,11 @@ def main():
         k = int(m.sum())
         if k < 100:
             continue
-        # ~24h overlap per decision → effective N deflated by 24 / 重叠样本有效N缩24倍
+        # ~24h overlap per decision → effective N deflated by 24. WHY: adjacent
+        # hourly samples share ~23/24 of their 24h label window, so treating
+        # them as independent would inflate the t-stat by ~sqrt(24) (~4.9x).
+        # 相邻小时样本的 24h 标签窗口重叠 ~23/24，按独立样本算 t 值会虚高
+        # ~4.9 倍，故有效 N 除以 24。
         ic_t = ic[m].mean() / max(ic[m].std(), 1e-12) * np.sqrt(k / 24)
         out[name] = {
             "n": k, "rank_ic": float(ic[m].mean()), "ic_t_eff": float(ic_t),

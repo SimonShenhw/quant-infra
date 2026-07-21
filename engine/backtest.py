@@ -1,13 +1,36 @@
 """
-Main Backtest Orchestrator.
+Main Backtest Orchestrator (EventBus demo stack).
 
-Wires together the EventBus, data feed, strategy, execution handler,
-matching engine, portfolio, and risk manager into a single event loop.
+WHAT — wires the EventBus, strategy, execution handler, matching engine,
+portfolio, and risk manager into a single event loop:
+TICK/MARKET -> strategy -> SIGNAL -> execution -> ORDER -> matching ->
+FILL -> portfolio, with mark-to-market after every price event.
 
-回测主调度器。
+WHY this shape — pub/sub over typed events mirrors how a live trading
+process is structured (components communicate only through the bus), so
+the same strategy/execution code is reusable for paper trading, and each
+component can be tested in isolation.
 
-将 EventBus、数据源、策略、执行处理器、撮合引擎、组合管理和风控管理器
-整合到单一事件循环中。
+HONESTY NOTE — legacy/demonstration layer, NOT in the v11+
+result-producing path: every published number comes from the simplified
+~100-line long-short loops inside the run scripts (run_v13_final.py et
+al.), not from this engine.  Known wiring gap kept as-is (M-9):
+RiskManager.check_order is never subscribed to ORDER events nor invoked
+by the ExecutionHandler, so the advertised drawdown circuit breaker
+never fires here.  Documented, not fixed — see REVIEW_2026-06-10.md ①
+and M-9.
+
+回测主调度器（EventBus 演示栈）。
+
+将 EventBus、策略、执行处理器、撮合引擎、组合管理和风控管理器整合到
+单一事件循环中：TICK/MARKET → 策略 → SIGNAL → 执行 → ORDER → 撮合 →
+FILL → 组合，每个价格事件后做逐日盯市。选择 pub/sub 是为了让组件只经
+事件总线通信——同一套代码可复用于模拟盘，且各组件可独立测试。
+
+诚实披露：遗留/演示层，不在 v11+ 出结果路径上——已发布结果全部出自
+run 脚本内的简化多空循环。M-9：RiskManager.check_order 从未订阅 ORDER
+事件、也未被执行处理器调用，回撤熔断在此引擎中从不触发。如实记录、
+未修复——见 REVIEW_2026-06-10.md。
 """
 from __future__ import annotations
 
@@ -34,7 +57,8 @@ from engine.risk import RiskManager
 
 class BacktestEngine:
     """
-    Production-grade event-driven backtester.
+    Event-driven backtester (demonstration stack — see module HONESTY
+    NOTE; the v11+ published results do not run through this class).
 
     Usage:
         engine = BacktestEngine(initial_cash=1_000_000)
@@ -42,7 +66,7 @@ class BacktestEngine:
         engine.run(tick_data)
         print(engine.portfolio.summary())
 
-    生产级事件驱动回测器。
+    事件驱动回测器（演示栈——见模块诚实披露；v11+ 已发布结果不经过本类）。
 
     用法：
         engine = BacktestEngine(initial_cash=1_000_000)
@@ -73,7 +97,13 @@ class BacktestEngine:
         self._strategy_handler: Optional[Callable[[Event], Optional[List[Event]]]] = None
         self._verbose: bool = verbose
 
-        # wire event bus — risk is checked synchronously inside execution handler / 连接事件总线 - 风控在执行处理器内同步检查
+        # wire event bus.  NOTE (M-9): RiskManager is passed into the execution
+        # handler, but the handler only polls `is_circuit_broken` (which nothing
+        # ever sets) — `check_order` is NOT subscribed to ORDER events here, so
+        # the risk gate is effectively inert.  Documented, not fixed.
+        # 连接事件总线。注意（M-9）：RiskManager 虽传入执行处理器，但处理器只
+        # 轮询从未被置位的 `is_circuit_broken`——`check_order` 并未订阅 ORDER
+        # 事件，风控关卡实际不生效。如实记录、未修复。
         self.bus.subscribe(EventType.TICK, self._on_tick)
         self.bus.subscribe(EventType.MARKET, self._on_market)
         self.bus.subscribe(EventType.SIGNAL, self.execution.handle_signal)
@@ -83,6 +113,10 @@ class BacktestEngine:
     def register_strategy(
         self, handler: Callable[[Event], Optional[List[Event]]]
     ) -> None:
+        """Subscribe a strategy handler to MARKET events; any events it
+        returns (typically SignalEvents) are re-published by the bus.
+        将策略处理器订阅到 MARKET 事件；其返回的事件（通常是 SignalEvent）
+        由总线再次发布。"""
         self._strategy_handler = handler
         self.bus.subscribe(EventType.MARKET, handler)
 

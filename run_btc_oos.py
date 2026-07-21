@@ -1,3 +1,12 @@
+# ============================================================================
+# HISTORICAL ARTIFACT / 历史存档 - early single-asset BTC out-of-sample check
+# Kept as project record. Results produced before the C-1 ms->us timestamp
+# fix (2026-06-10) are unreliable as published; the current pipeline is
+# run_v13_final.py (research) + run_paper_daily.py (live).
+# See REVIEW_2026-06-10.md for the full audit trail.
+# 保留作为项目演进记录；C-1 时间戳修复(2026-06-10)之前产出的结果不可作为
+# 依据；当前管线见 run_v13_final.py 与 run_paper_daily.py。
+# ============================================================================
 """
 run_btc_oos.py — Out-of-Sample BTC/USDT Backtest with Real Market Data.
 

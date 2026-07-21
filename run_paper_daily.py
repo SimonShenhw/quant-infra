@@ -2,18 +2,55 @@
 run_paper_daily.py — Daily batch paper trading with gap catch-up.
 每日批处理模拟盘（带缺失日补课）。
 
-Flow per run (~1 minute):
+WHAT — one unattended run per day (~1 minute) advances every live paper track
+(v13 banded basket, carry sleeve, 50/50 combo, v14 O2 continuous book) plus
+the legacy top1/bottom1 series, all persisted to paper_daily.db:
   1. Read DB to find the last recorded day; fetch enough CLOSED 1h bars to
      cover the gap (250 + 24/missed-day, multi-exchange okx -> bybit -> gate,
      HARD FAIL if any of the 20 assets is missing).
   2. Fetch real funding-rate history and align to bars (v13 checkpoints).
-  3. BACKFILL each missed day at the 11:00 UTC (19:00 Beijing) mark:
+  3. BACKFILL each missed day at the 23:00 UTC mark (~19:00 US Eastern —
+     aligned with the owner's 19:30 local scheduled run, so backfilled marks
+     sit on the same clock as real ones):
        - signal scores recomputed from bars available at that mark (causal,
          deterministic — what the model WOULD have said; feeds live rank IC)
-       - basket positions stay FROZEN (nobody traded on missed days); only
-         daily PnL marks are recorded (slot_changes=0, cost=0)
+       - basket positions stay FROZEN (nobody traded on missed days, so
+         freezing is the only honest accounting — pretending trades happened
+         would fabricate fills); only daily PnL marks are recorded
+         (slot_changes=0, cost=0)
   4. Reconcile + run TODAY's inference, banded basket update, log everything.
      Same-day reruns upsert instead of duplicating.
+
+WHY the key design choices / 设计取舍:
+  - Banded top-K (Novy-Marx & Velikov, RFS 2016 buy/hold spread) instead of
+    plain top-K: on identical OOS predictions and costs, construction alone
+    swings the v13 backtest from -44.5% (hourly top-1) to +32.6% (banded
+    top-3). The weak 0.06-IC signal only survives when turnover is
+    suppressed — see README results table.
+  - Per-ledger exception isolation + nonzero exit + Desktop sentinel: both
+    historical result-invalidating bugs (v11.1 random weights, C-1 µs
+    timestamps) were SILENT failures. One sick ledger must not lose the
+    others' day, but every error must end up loudly visible (F1 alert chain).
+  - Hard-fail if any of the 20 symbols is missing (H-3): the model assigns
+    asset identity embeddings BY POSITION in the sorted symbol list; a
+    silently dropped symbol shifts every embedding and still emits
+    plausible-looking signals.
+
+INVARIANTS (guarded by tests/run_invariants.py — run it before touching any
+shared module):
+  - Causality: all factor primitives are causal, so backfilled scores from
+    slicing rows [:i+1] equal a true historical run (T2).
+  - Frozen DB schemas: the ledgers are pre-registered evidence for the
+    September v14 gate (ROADMAP_2026-07-13); date-keyed upserts keep reruns
+    idempotent (T6). Do not alter table layouts mid-series.
+  - Positions take effect at the NEXT daily mark: PnL is always computed on
+    the PREVIOUS state row (H-1 — no decision-bar lookahead).
+
+中文摘要：每日无人值守运行一次，推进 v13 篮子 / carry / combo / O2 四本账 +
+legacy 序列。banding 双阈值（而非朴素 top-K）是弱信号净值存活的关键；缺失日
+信号因果补算、篮子持仓冻结（没人交易 = 诚实记账）；账本间故障隔离但必须响亮
+报错（两个历史致命 bug 都是静默失败）；账本 schema 冻结至九月 gate，是预注册
+证据；仓位一律下个 mark 生效（H-1 无决策 bar 前视）。
 
 v13 upgrades vs the old script: see REVIEW_2026-06-10.md appendix
 (H-2/H-3/H-4/H-5/M-4/L-2/L-3 fixes + banded top-K basket).
@@ -44,6 +81,13 @@ from sleeves.banding import banded_update_symbols
 
 DB_PATH: str = str(BASE_DIR / "paper_daily.db")
 
+# The 20-asset v13 universe — FROZEN while the live series runs. Never just
+# delete a symbol here: banding would let its position "evaporate" without
+# ever booking the exit (ROADMAP G1 delisting SOP: settle manually in the
+# state/pnl tables FIRST, then edit, then note it in run_meta). Positional
+# asset embeddings also mean any universe change = model retrain.
+# 20币宇宙冻结：直接删币会让持仓“无声蒸发”（离场损益永不确认），必须先按
+# ROADMAP 退市SOP手工确认离场再改名单；位置嵌入决定了改宇宙=重训模型。
 SYMBOLS: List[str] = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
     "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT",
@@ -74,6 +118,9 @@ DROP_FACTORS_FALLBACK = {"volume_zscore", "volume_momentum", "macd", "klow"}
 
 
 def utc_today() -> str:
+    """UTC date key for every ledger row — local-timezone keys once let the
+    same calendar day fork across runs (review L-2).
+    UTC 日期键：本地时区/夏令时曾导致同一天记账分叉（L-2）。"""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
@@ -120,6 +167,13 @@ def date_range_exclusive(d0: str, d1: str) -> List[str]:
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
+    """Create-if-missing all ledger tables. Schemas are FROZEN: these tables
+    are the pre-registered evidence for the September v14 gate
+    (ROADMAP_2026-07-13), so only additive migrations are allowed (see the
+    guarded ALTER below). date PRIMARY KEYs are what make same-day reruns
+    upsert instead of double-count (M-4).
+    建库：schema 冻结（账本即九月 gate 的预注册证据），只允许加列式迁移；
+    date 主键保证同日重跑 upsert 不重复记账（M-4）。"""
     conn = sqlite3.connect(db_path)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS daily_signals (
@@ -191,6 +245,8 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
 
 def last_recorded_date(conn: sqlite3.Connection) -> Optional[str]:
+    """Latest recorded day (anchor for gap detection / backfill sizing).
+    最近一次记录日：断档检测与拉取深度的锚点。"""
     row = conn.execute("SELECT MAX(date) FROM daily_signals").fetchone()
     return row[0] if row and row[0] else None
 
@@ -200,17 +256,27 @@ def last_recorded_date(conn: sqlite3.Connection) -> Optional[str]:
 # ============================================================================
 
 def _drop_unclosed(ohlcv: List[List[float]]) -> List[List[float]]:
-    """Keep only bars whose 1h window has fully elapsed (H-5).
-    仅保留已完整收盘的 1h K线。"""
+    """Keep only bars whose 1h window has fully elapsed (H-5): CCXT's last
+    candle is in-progress (close = instantaneous price, volume = partial),
+    but training only ever saw completed bars — a partial bar skews every
+    factor at the sequence tail AND the reconcile price.
+    仅保留已完整收盘的 1h K线（H-5）：CCXT 最后一根是进行中蜡烛，
+    训练分布里不存在这种 bar，喂进去会污染序列尾部因子与对账价。"""
     now_ms = int(time.time() * 1000)
     return [k for k in ohlcv if k[0] + 3_600_000 <= now_ms]
 
 
 def fetch_bars(symbols: List[str], n_bars: int) -> Dict[str, List[Tuple]]:
     """
-    Latest N CLOSED 1h bars per symbol; okx -> bybit -> gate fill; raises if
-    ANY symbol missing (positional asset embedding, H-3).
+    Latest N CLOSED 1h bars per symbol, filled across okx -> bybit -> gate.
+    Raises if ANY of the 20 symbols is still missing after all exchanges:
+    the model maps assets to identity embeddings BY POSITION in the sorted
+    symbol list, so one silently skipped symbol shifts every embedding and
+    the script would still emit plausible-looking signals (H-3) —
+    all-20-or-die is the only safe behavior for an unattended run.
     Returns {clean_symbol: [(ts_ms, o, h, l, c, v), ...]}.
+    跨所补抓已收盘K线，20币强制全齐：缺任何一币都会让位置嵌入整体错位
+    却照常出信号（H-3），无人值守下宁可硬失败。
     """
     import ccxt
     result: Dict[str, List[Tuple]] = {}
@@ -256,8 +322,16 @@ def fetch_bars(symbols: List[str], n_bars: int) -> Dict[str, List[Tuple]]:
 def fetch_funding(
     symbols: List[str], bars: Dict[str, List[Tuple]], device: torch.device,
 ) -> Optional[Dict[str, Tensor]]:
-    """Real 8h funding history forward-filled onto bar timestamps (H-4).
-    真实资金费率前向填充到 bar 时间戳。okx -> bybit -> gate。"""
+    """Real 8h funding history forward-filled onto bar timestamps (H-4:
+    the model was trained on real funding, so feeding an OHLCV proxy at
+    serve time would put two different physical quantities on one input
+    channel). Unlike bars, missing symbols soft-fail to zeros: the carry
+    sleeve detects an all-zero cross-section and skips the day, and degraded
+    symbols are recorded in run_meta so September analysis can flag
+    degraded-signal days (G2).
+    真实资金费率前向填充到 bar 时间戳（okx -> bybit -> gate）。与K线不同，
+    缺失降级为全零而非硬失败：carry 侧识别全零后跳过当日，且退化名单落库
+    run_meta，九月分析可甄别退化信号日（G2）。"""
     import ccxt
     out: Dict[str, Tensor] = {}
     for name in ["okx", "bybit", "gate"]:
@@ -283,6 +357,9 @@ def fetch_funding(
                 rt = np.asarray([float(h["fundingRate"]) for h in hist], dtype=np.float32)
                 order = np.argsort(ts)
                 ts, rt = ts[order], rt[order]
+                # last event AT/BEFORE each bar — the C-1 postmortem's funding
+                # lookahead came from unit-mismatched searchsorted; both sides
+                # are ms here / 取每根bar之前最近一次费率（因果ffill，无前视）
                 idx = np.searchsorted(ts, bar_ts, side="right") - 1
                 vals = np.zeros(len(bar_ts), dtype=np.float32)
                 ok = idx >= 0
@@ -309,6 +386,13 @@ def fetch_funding(
 # ============================================================================
 
 def load_checkpoint(ckpt_path: Path, device: torch.device) -> dict:
+    """Load a production checkpoint or die trying. A missing ckpt MUST be
+    fatal: the v11.1 incident ran paper trading on RANDOM weights for 12
+    days because initialization silently proceeded without loading.
+    weights_only=True is tried first (safe unpickling, L-1); older ckpts
+    with non-tensor metadata fall back to the permissive path.
+    加载生产 checkpoint，缺失即失败——v11.1 事故正是静默跑了12天随机权重；
+    优先 weights_only=True 安全反序列化（L-1），旧格式再回退。"""
     if not ckpt_path.exists():
         raise FileNotFoundError(
             f"Checkpoint not found: {ckpt_path}\n"
@@ -321,6 +405,13 @@ def load_checkpoint(ckpt_path: Path, device: torch.device) -> dict:
 
 
 def _resolve_factor_names(ckpt: dict) -> List[str]:
+    """Resolve the factor list LOUDLY: prefer the ckpt's own factor_names,
+    else registry-minus-drops, and raise on any count mismatch. A plausible
+    but wrong factor list silently scrambles every input channel (the M-2
+    class of bug — v11 ckpts once stored 21 names for a 17-factor model);
+    invariant T3 pins this behavior.
+    因子列表解析：优先 ckpt 自带名单，数量对不上必须炸——静默错位会污染
+    全部输入通道（M-2 教训），行为由不变量 T3 锁定。"""
     n_expected = int(ckpt["n_factors"])
     saved = ckpt.get("factor_names")
     if isinstance(saved, list) and len(saved) == n_expected:
@@ -336,6 +427,12 @@ def _resolve_factor_names(ckpt: dict) -> List[str]:
 
 
 def build_model(ckpt: dict, device: torch.device) -> CrossAssetGRUAttention:
+    """Rebuild the exact trained architecture from the ckpt's stored
+    hyperparams (serve can never drift from train), with dropout=0 and
+    eval() so inference is deterministic — a live signal must be a pure
+    function of the data, or backfill/rerun idempotence breaks.
+    按 ckpt 超参重建模型（train/serve 架构零漂移）；dropout=0 + eval()
+    保证推理确定性——否则补课与同日重跑的幂等性不成立。"""
     model = CrossAssetGRUAttention(
         n_factors=ckpt["n_factors"], d_model=ckpt["d_model"],
         gru_layers=ckpt["gru_layers"], n_cross_heads=ckpt["n_cross_heads"],
@@ -397,9 +494,13 @@ def mark_indices_for_date(
 ) -> Optional[Dict[str, int]]:
     """
     Index of the daily-mark bar (open at MARK_HOUR-1 UTC, closes MARK_HOUR)
-    per symbol. None if any symbol lacks a bar within 3h before the mark or
-    has too little history before it.
-    每标的找到记账时点对应的bar索引；任一标的缺数据则返回 None。
+    per symbol. Returns None — and the caller then SKIPS that backfill day —
+    if any symbol lacks a bar within 3h of the mark or has <72 bars of
+    history before it: a skipped day is visible and recoverable, whereas a
+    mark computed on misaligned or under-warmed factors would sit silently
+    wrong in the evidence ledger forever.
+    每标的找到记账时点对应的bar索引；任一标的缺bar或暖机不足则整日返回 None
+    （补课日跳过——宁缺毋错：错的mark会永久留在证据账本里）。
     """
     mark_open_ms = int(datetime.strptime(date, "%Y-%m-%d")
                        .replace(tzinfo=timezone.utc, hour=MARK_HOUR_UTC - 1)
@@ -431,8 +532,15 @@ CARRY_BOOK = PortfolioBook("carry", "carry_state", "carry_pnl",
 
 def load_o2_sleeve(device) -> Optional[Tuple]:
     """v14 O2 sleeve (continuous weights, own 16-symbol universe/factors);
-    active only when its production checkpoint exists.
-    O2 sleeve：有 o2_production.pt 才启用；自带 16 币宇宙与 18 因子。"""
+    active only when its production checkpoint exists — enabling/retiring O2
+    is a file operation, not a code change. tau defaults to the ckpt's
+    construction (0.2): Garleanu-Pedersen partial trading, the exact τ=1/5
+    configuration used by the pre-registered gate backtest
+    (RESEARCH_2026-07-13) — live must replicate the gated setup, not
+    "improve" on it.
+    O2 sleeve：有 o2_production.pt 才启用（上/下线=文件操作，不改代码）；
+    自带 16 币宇宙与 18 因子；tau=0.2 为 GP 部分调仓，与预注册 gate 回测
+    同参——live 只复现被 gate 的配置，不做临场优化。"""
     path = BASE_DIR / "checkpoints" / "o2_production.pt"
     if not path.exists():
         return None

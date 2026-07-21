@@ -19,6 +19,26 @@ N 个等额切片，在连续 N 根 K 线上分批执行。
   - 单笔冲击更小
   - 均价效应降低最差成交价
   - 即使总体方向不利，部分切片仍可能有利成交
+
+WHY / 为什么存在 — this IS the cost model of the current result path:
+v4's Sharpe 1.38 was a "fill illusion" (instant fills at desired prices);
+v5 modeled adverse selection honestly and lost 48% to friction; v6+
+adopted 1h bars + TWAP slicing to survive it (README version history).
+The v13 backtest (+32.6% / Sharpe 0.81) runs every leg through this
+executor on each asset's OWN price path (per-leg costs, the M-6 fix),
+with positions effective NEXT bar (H-1 fix in the run script).  The flat
+8bps/side second-engine cross-check (+18.2% / Sharpe 0.53) exists because
+this simulated cost model is a modeling choice, not ground truth — see
+ENGINE_CROSSCHECK_2026-06-10.md.
+
+v4 的高夏普是"成交幻觉"；v5 诚实建模逆向选择后被摩擦吃掉 48%；v6 起改用
+1h + TWAP 拆单求生（README 版本史）。v13 回测的每条腿都经本执行器在该资产
+自身价格路径上模拟（按腿计费，M-6 修复），仓位次 bar 生效（H-1 修复）。
+固定 8bps/边的独立第二引擎交叉验证是保守下界。
+
+Reproducibility (REVIEW M-5): per-slice randomness uses module-level
+`random` — the caller must seed for deterministic runs (v13 scripts do).
+可复现性（M-5）：切片随机性来自未播种的 random，调用方需设种子。
 """
 from __future__ import annotations
 

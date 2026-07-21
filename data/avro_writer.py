@@ -2,8 +2,23 @@
 Avro serialization for real-time streaming data.
 Avro 实时流数据序列化。
 
-Row-oriented format ideal for append-only streaming writes (vs Parquet for batch reads).
-行式格式，适合追加写入的流式场景（Parquet 适合批量读取）。
+WHY Avro here at all: row-oriented, schema-embedded, append-friendly —
+the natural container for one-record-at-a-time WebSocket streams, where
+Parquet (columnar, immutable footer) forces whole-file rewrites. Parquet
+remains the batch/analytics format of the lake; Avro is the streaming leg.
+为什么用 Avro：行式、自带 schema、适合追加——是逐条到达的 WebSocket 流的
+天然容器；Parquet（列式、不可变 footer）在此场景下每次都要整文件重写。
+数据湖的批量/分析格式仍是 Parquet，Avro 只负责流式一端。
+
+STATUS — honest scope note: research/data-collection infrastructure
+(v10-era streaming leg). Not imported by any current pipeline — the v13+
+result path trains from archived klines via lake_loader, and even
+ws_daemon currently flushes Parquet, not Avro. Kept as the designated
+serializer for future tick-level LOB collection.
+状态——如实说明：研究/采集基础设施（v10 时期的流式分支）。当前没有任何
+管线导入它——v13+ 结果路径经 lake_loader 从归档 K 线训练，连 ws_daemon
+目前刷盘用的也是 Parquet 而非 Avro。保留用作未来 tick 级 LOB 采集的
+指定序列化器。
 """
 from __future__ import annotations
 

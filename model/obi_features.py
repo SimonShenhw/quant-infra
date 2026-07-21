@@ -16,6 +16,13 @@ All features are computed as PyTorch tensors for CUDA acceleration.
   - arXiv 1512.03492: 队列失衡作为方向性预测因子
 
 所有特征以PyTorch张量计算，支持CUDA加速。
+
+STATUS (honest note): the intraday/LOB direction is explicitly PARKED
+(ROADMAP_2026-07-13) — it needs depth-stream data infrastructure the
+project has not built, and the daily-frequency system must prove itself
+first. These features are not consumed by any current pipeline.
+现状注记：日内/LOB 方向已在 ROADMAP 中明确搁置（需要 depth 流数据基建，
+且日频系统尚未证明自己）；当前没有任何管线使用这些特征。
 """
 from __future__ import annotations
 

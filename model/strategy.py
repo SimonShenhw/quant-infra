@@ -16,6 +16,14 @@ Transformer驱动策略（v2 — 生产级）。
   - 换手惩罚（避免频繁交易侵蚀alpha）
   - 止损触发后的冷却期
   - 方向准确率跟踪，用于实盘监控
+
+STATUS (honest note): drives the legacy EventBus engine (engine/backtest.py),
+which is NOT the v11+ result-producing path — the published results come
+from the simplified loops inside the run_v*.py scripts, and the live system
+uses sleeves/ + run_paper_daily.py (see REVIEW_2026-06-10.md). Kept as the
+event-driven demonstration layer.
+现状注记：驱动的是 legacy 事件引擎，不在 v11+ 结果路径上（已发布结果来自
+run 脚本内的简化循环，live 走 sleeves 框架）；作为事件驱动演示层存档。
 """
 from __future__ import annotations
 

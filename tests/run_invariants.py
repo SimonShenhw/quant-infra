@@ -4,14 +4,31 @@ Invariant regression tests (ROADMAP 2026-07-13, cross-cutting).
 
     python tests/run_invariants.py
 
-Four invariants, chosen because both historical result-invalidating bugs
-(random weights, us-timestamp corruption) were SILENT failures:
-  T1  timestamp-unit golden test (us CSV -> exact hourly bar count)
-  T2  no-lookahead (noise after t must not change factors at <= t)
-  T3  checkpoint fingerprint (factor list resolution + tamper detection)
-  T4  ledger conservation (basket/carry/combo bookkeeping vs analytic values)
+WHY invariants rather than coverage: both historical result-invalidating
+bugs (v11.1 random weights, C-1 us-timestamp corruption) were SILENT
+failures that ordinary unit coverage would have blessed — the code ran fine,
+the numbers were garbage. Each test therefore pins one FAILURE MODE to a
+loud assertion; the ledger tests (T4-T6) assert against hand-derived
+ANALYTIC values, never snapshots of current output, so the suite survives
+refactors and only breaks when semantics break:
 
-No pytest dependency; plain asserts; exit code 1 on any failure.
+  T1  timestamp-unit golden test (us CSV -> exact hourly bar count)
+      -> the C-1 class: ms/us mixing turned 97% of "1h bars" into 5m bars
+  T2  no-lookahead (noise after t must not change factors at <= t)
+      -> the lookahead class; also the invariant that legitimizes causal
+         missed-day backfill (slice [:i+1] == truncated recompute)
+  T3  checkpoint fingerprint (factor-list resolution + tamper detection)
+      -> the v11.1 class: plausible inference on wrong weights / scrambled
+         factor channels (M-2)
+  T4  ledger conservation: basket/carry/combo bookkeeping vs analytic values
+  T5  ledger conservation: ContinuousBook (O2) vs analytic GP values
+  T6  upsert idempotence / gap handling / cumulative-chain telescoping
+      -> integrity of the pre-registered September evidence ledgers
+
+All DB tests run on throwaway temp files — the live paper_daily.db is never
+touched. No pytest dependency; plain asserts; exit code 1 on any failure.
+中文：每条不变量对应一类历史致命故障（共性=静默失败）；账本断言用解析值
+而非输出快照，重构不误报、语义坏才报；全部用临时库，绝不碰线上账本。
 """
 from __future__ import annotations
 
@@ -37,7 +54,17 @@ from data.lake_loader import load_klines
 
 
 def t1_timestamp_golden():
-    """ms + us mixed archives -> normalized ms, exact 1h bucket count."""
+    """ms + us mixed archives -> normalized ms, exact 1h bucket count.
+
+    Golden reconstruction of the C-1 incident: one ms day (2024/12) plus one
+    us day (2025/01), exactly mirroring Binance Vision's 2025-01 unit switch.
+    Before the fix, `// 3_600_000` bucketed us rows into 3.6-second bins and
+    every 5m bar became its own "1h bar" — silently, with plausible output.
+    Asserts the loader normalizes units AND the aggregation yields exactly
+    48 hourly buckets of 12 bars each (counts, not distributions: a unit bug
+    cannot hide in an exact-count golden).
+    复刻 C-1 事故的最小黄金样本：ms/µs 各一天，断言归一化后恰好 48 个
+    1h 桶、每桶 12 根——精确计数让单位 bug 无处遁形。"""
     with tempfile.TemporaryDirectory() as tmp:
         base_ms = 1_700_000_000_000 - (1_700_000_000_000 % 3_600_000)  # hour-aligned
         day = 24 * 12  # 288 five-minute bars / 一天288根5m
@@ -62,7 +89,16 @@ def t1_timestamp_golden():
 
 
 def t2_no_lookahead():
-    """Replacing data AFTER t with noise must not change factors at <= t."""
+    """Replacing data AFTER t with noise must not change factors at <= t.
+
+    Sweeps the ENTIRE registered factor stack (incl. the funding extra) in
+    one shot instead of auditing factors one by one: any future-dependent
+    primitive anywhere in the pipeline moves some value at <= t0. This is
+    also the invariant that makes missed-day backfill honest — backfilled
+    scores are computed by slicing rows [:i+1], which equals a true
+    historical run ONLY if every factor is causal.
+    一次性扫全因子栈的自动化前视检测：t 之后换噪声、t 之前必须逐位不变。
+    补课打分的合法性（切片=截断重算）正建立在这条不变量上。"""
     g = torch.Generator().manual_seed(7)
     n, t0 = 400, 300
     c = (torch.randn(n, generator=g) * 0.01 + 1).cumprod(0) * 100
@@ -92,7 +128,17 @@ def t2_no_lookahead():
 
 
 def t3_checkpoint_fingerprint():
-    """Factor-list resolution must match the ckpt and fail loudly on tamper."""
+    """Factor-list resolution must match the ckpt and fail loudly on tamper.
+
+    Guards the v11.1 failure class: paper trading ran 12 days on RANDOM
+    weights because initialization silently proceeded — and its cousin M-2,
+    where a plausible-but-wrong factor list silently scrambles every input
+    channel (v11 ckpts once stored 21 names for a 17-factor model). Asserts
+    the production ckpt resolves cleanly against the registry AND that a
+    tampered ckpt (count matching neither saved names nor fallback) raises
+    instead of guessing.
+    锁定 v11.1 类故障：因子清单必须与 ckpt 精确对账，对不上要炸而不是猜——
+    静默错位会污染全部输入通道却照常出“像样”的信号。"""
     from run_paper_daily import _resolve_factor_names, load_checkpoint
     ckpt_path = BASE / "checkpoints" / "v13_production.pt"
     assert ckpt_path.exists(), "v13_production.pt missing"
@@ -114,7 +160,18 @@ def t3_checkpoint_fingerprint():
 
 
 def t4_ledger_conservation():
-    """Bookkeeping must reproduce analytic values exactly (1e-9)."""
+    """Bookkeeping must reproduce analytic values exactly (1e-9).
+
+    The scenario is engineered so every number is derivable by hand (flat
+    100.0 closes, +2%/-1% legs, constant funding rate -> accrual = 3*rate):
+    asserting analytic values rather than snapshots is what lets this test
+    survive refactors — it pinned the Phase 1 extraction of basket_step/
+    carry_step into sleeves.PortfolioBook as bit-for-bit equivalent. Covers
+    first-day init, a no-change mark, frozen-day compounding, and a band
+    exit with its 2-slot cost.
+    场景全部可手算（解析值而非快照），因此重构不误报——Phase 1 把记账抽入
+    共享 PortfolioBook 时靠本测试锁定逐位一致；覆盖建仓/无变动/冻结复利/
+    出带换槽四种记账日。"""
     from run_paper_daily import (init_db, basket_step, carry_step, combo_step,
                                  EST_COST_BPS)
     syms = [f"A{i:02d}" for i in range(1, 21)]
@@ -193,7 +250,16 @@ def t4_ledger_conservation():
 
 
 def t5_continuous_book_conservation():
-    """ContinuousBook (O2 sleeve ledger) must match analytic GP values."""
+    """ContinuousBook (O2 sleeve ledger) must match analytic GP values.
+
+    Same analytic-values philosophy as T4, for the v14 continuous-weight
+    ledger: the GP recursion w' = (1-tau)w + tau*target has closed-form
+    turnover (tau on the ramp day, tau*(1-tau) the next flat day), so the
+    ledger's turnover/cost/cum chain is asserted against those exact
+    numbers. Guards the ramp-from-zero start that matches the gated
+    backtest, frozen-day zero-turnover, and cost = |dw| x 8bps.
+    GP 递推有闭式换手（首日 tau、次日 tau(1-tau)），账本必须精确复现；
+    锁定从零爬坡、冻结日零换手与 |Δw|×8bps 成本口径。"""
     from run_paper_daily import init_db
     from sleeves import ContinuousBook
     syms = [f"A{i:02d}" for i in range(1, 17)]
@@ -235,7 +301,12 @@ def t5_continuous_book_conservation():
 def t6_orchestration_upsert_and_chain():
     """Same-day rerun idempotence, multi-day gaps, and cumulative-chain
     telescoping — the evidence-integrity semantics the September gate
-    depends on. 同日重跑幂等、跨日gap、复利链守恒。"""
+    depends on: a rerun must UPSERT one row recomputed from yesterday (not
+    duplicate or compound on itself), a gap must record its true n_days and
+    compound once, and every stored cum must equal the running product of
+    stored nets — so the ledger can be audited end-to-end at gate time.
+    同日重跑幂等（单行、从昨日重算）、跨日 gap 记真实天数且单次复利、
+    存储的 cum 恒等于净收益连乘——九月裁决时账本可全程复核。"""
     from run_paper_daily import init_db, basket_step
     syms = [f"A{i:02d}" for i in range(1, 21)]
     ckpt = {"basket_k": 3, "enter_band": 3, "exit_band": 6}
@@ -278,6 +349,9 @@ def t6_orchestration_upsert_and_chain():
 
 
 def main():
+    """Run every invariant even after a failure (one broken invariant must
+    not mask another), print the x/6 tally, exit nonzero on any failure.
+    全部跑完不早退（故障不互相遮蔽），任一失败以非零码退出。"""
     tests = [t1_timestamp_golden, t2_no_lookahead,
              t3_checkpoint_fingerprint, t4_ledger_conservation,
              t5_continuous_book_conservation, t6_orchestration_upsert_and_chain]

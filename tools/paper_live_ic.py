@@ -31,6 +31,7 @@ import json
 import math
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 
 DB = Path(__file__).resolve().parent.parent / "paper_daily.db"
@@ -53,27 +54,26 @@ def spearman(xs, ys) -> float:
     return cov / max(vx * vy, 1e-12)
 
 
-def main():
-    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+def compute_live_ics(db_path: Path = DB):
+    """Return (n_logged_days, pairs) where pairs is a list of
+    (date_t, date_t1, n_assets, rank_ic, gap_days).
+
+    Extracted 2026-07-23 (pure refactor, byte-identical main() output) so
+    tools/gate_check.py can judge the pre-registered September "live IC > 0"
+    clause on THIS implementation instead of a second copy — the 2026-06-10
+    engine crosscheck showed dual implementations of the same arithmetic
+    drift apart, so the registered judge stays single-sourced.
+    2026-07-23 纯提取重构：九月 gate 裁决工具复用本函数而非再抄一份——
+    交叉验证的教训是同一套算术写两遍必然漂移，注册判据只留单一实现。
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     rows = conn.execute(
         "SELECT date, all_scores, all_closes FROM daily_signals "
         "WHERE all_closes IS NOT NULL ORDER BY date"
     ).fetchall()
     conn.close()
 
-    if len(rows) < 2:
-        print(f"Need >= 2 days with all_closes, have {len(rows)}. "
-              f"Come back after a few more daily runs.")
-        sys.exit(0)
-
-    ics = []
-    # gap_d is printed because run days were historically irregular (1-6 day
-    # gaps pre-2026-06-11 scheduler); a multi-day gap means the "next-day"
-    # return actually spans several days — read those ICs with care.
-    # gap_d 提示相邻记录日间隔：调度器上线前运行不规律，跨多日的"次日"收益
-    # 实为多日收益，对应 IC 需谨慎解读。
-    print(f"{'date_t':<12} {'date_t+1':<12} {'n_assets':>8} {'rank_IC':>9} {'gap_d':>6}")
-    print("-" * 52)
+    pairs = []
     for (d0, s0, c0), (d1, _, c1) in zip(rows[:-1], rows[1:]):
         scores = json.loads(s0)
         closes0 = json.loads(c0)
@@ -85,10 +85,30 @@ def main():
         sc = [scores[a] for a in common]
         rt = [closes1[a] / closes0[a] - 1.0 for a in common]
         ic = spearman(sc, rt)
-        ics.append(ic)
-        from datetime import datetime
         gap = (datetime.strptime(d1, "%Y-%m-%d") - datetime.strptime(d0, "%Y-%m-%d")).days
-        print(f"{d0:<12} {d1:<12} {len(common):>8} {ic:>+9.4f} {gap:>6}")
+        pairs.append((d0, d1, len(common), ic, gap))
+    return len(rows), pairs
+
+
+def main():
+    n_days, pair_rows = compute_live_ics()
+
+    if n_days < 2:
+        print(f"Need >= 2 days with all_closes, have {n_days}. "
+              f"Come back after a few more daily runs.")
+        sys.exit(0)
+
+    # gap_d is printed because run days were historically irregular (1-6 day
+    # gaps pre-2026-06-11 scheduler); a multi-day gap means the "next-day"
+    # return actually spans several days — read those ICs with care.
+    # gap_d 提示相邻记录日间隔：调度器上线前运行不规律，跨多日的"次日"收益
+    # 实为多日收益，对应 IC 需谨慎解读。
+    print(f"{'date_t':<12} {'date_t+1':<12} {'n_assets':>8} {'rank_IC':>9} {'gap_d':>6}")
+    print("-" * 52)
+    ics = []
+    for d0, d1, n_common, ic, gap in pair_rows:
+        ics.append(ic)
+        print(f"{d0:<12} {d1:<12} {n_common:>8} {ic:>+9.4f} {gap:>6}")
 
     if not ics:
         print("No computable day pairs yet.")

@@ -34,8 +34,12 @@ BASE = Path(__file__).resolve().parent.parent
 DB = BASE / "paper_daily.db"
 # Pre-registered decision dates (ROADMAP_2026-07-13 Phase 3) — the criteria
 # were frozen before the evidence; do not move them to fit the data.
-# 预注册 gate 日期：判据先于证据写死，不得事后挪动。
-GATES = {"carry 60d gate": "2026-09-11", "v13 90d gate": "2026-09-15"}
+# o2 gate registered late (2026-07-23, at 9/60 marks, user-signed): the track
+# went live 07-14, AFTER the ROADMAP froze — see the Phase-3 table footnote.
+# 预注册 gate 日期：判据先于证据写死，不得事后挪动。o2 为 07-23 追加注册
+# （track 上线晚于 ROADMAP，判据在 9/60 天时冻结并经用户签核）。
+GATES = {"carry 60d gate": "2026-09-11", "o2 60d gate": "2026-09-12",
+         "v13 90d gate": "2026-09-15"}
 STALE_WARN_DAYS = 2   # 1-day lag is normal (timezones/late runs) / 1天滞后属正常
 STALE_CRIT_DAYS = 3   # 3+ days = pipeline presumed dead -> Desktop sentinel / 视为停摆
 

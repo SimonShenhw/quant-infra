@@ -3,7 +3,7 @@ One-command health check for the unattended paper-trading system (read-only).
 无人值守系统健康检查（只读）。Usage: python tools/health_check.py
 
 WHAT: last-run recency, per-ledger continuity/gaps, cumulative returns,
-carry funding income, O2 gross ramp, DB backups, run_meta error notes,
+carry funding income, O2 realized gross, DB backups, run_meta error notes,
 September gate countdowns. Exit code: 0 healthy, 1 warnings, 2 critical
 (freshest ledger > 3 days stale).
 
@@ -99,13 +99,21 @@ def main():
     f = conn.execute("SELECT SUM(funding_pnl), COUNT(*) FROM carry_pnl").fetchone()
     if f and f[1]:
         print(f"\n  carry funding income to date: {f[0]:+.4%} over {f[1]} days")
-    # o2 ramp / o2 毛敞口爬坡
+    # o2 realized gross / o2 实测毛敞口
     r = conn.execute("SELECT date, weights FROM o2_state "
                      "ORDER BY date DESC LIMIT 1").fetchone()
     if r:
         w = json.loads(r[1])
+        # NOT a ramp: GP partial trading (w <- (1-tau)w + tau*target, tau=0.2)
+        # smooths a target that ROTATES daily, so realized gross settles at a
+        # steady state set by the target's autocorrelation (~0.38 over the
+        # 2026 live window), NOT at the target's nominal 1.0 -- convergence to
+        # 1.0 only holds for a CONSTANT target. The old "(target 1.0, GP ramp)"
+        # label made a converged 0.32 read as "still ramping up".
+        # 不是爬坡：GP 部分调仓平滑的是每日旋转的目标，实测 gross 稳态由目标
+        # 自相关决定（2026 live 窗口约 0.38），只有目标恒定才会收敛到名义 1.0。
         print(f"  o2 gross exposure: {sum(abs(x) for x in w.values()):.3f} "
-              f"(target 1.0, GP ramp)")
+              f"(GP steady state; nominal target 1.0 is per-day pre-smoothing)")
     conn.close()
 
     # backups / 备份

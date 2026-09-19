@@ -106,14 +106,17 @@ def _sharpe_daily(rets) -> tuple[float, float]:
     return sharpe, tstat
 
 
-def ew_buy_hold_benchmark(conn) -> tuple[float, str, str, int]:
-    """Equal-weight buy & hold over basket_state's first all_closes universe.
-    Returns (cum_return, start_date, end_date, n_assets). Assets missing on a
-    later day freeze at their last available mark (approximates realizing a
-    delisting at last price; universe is stable to date so this is currently
-    a no-op guard). 等权买入持有基准：首日宇宙，缺币按最后可得价冻结。"""
+def ew_buy_hold_benchmark(conn, cutoff: str) -> tuple[float, str, str, int]:
+    """Equal-weight buy & hold over basket_state's first all_closes universe,
+    marked to the LAST state row on or before `cutoff` (the window freeze —
+    see _window_cutoff). Returns (cum_return, start_date, end_date, n_assets).
+    Assets missing on a later day freeze at their last available mark
+    (approximates realizing a delisting at last price; universe is stable to
+    date so this is currently a no-op guard).
+    等权买入持有基准：首日宇宙，标记到 cutoff 当日，缺币按最后可得价冻结。"""
     rows = conn.execute(
-        "SELECT date, all_closes FROM basket_state ORDER BY date").fetchall()
+        "SELECT date, all_closes FROM basket_state WHERE date <= ? "
+        "ORDER BY date", (cutoff,)).fetchall()
     if not rows:
         return float("nan"), "—", "—", 0
     entry = json.loads(rows[0][1])
@@ -127,6 +130,37 @@ def ew_buy_hold_benchmark(conn) -> tuple[float, str, str, int]:
                 last_mark[a] = c
     cum = sum(last_mark[a] / entry[a] for a in entry) / len(entry) - 1.0
     return cum, rows[0][0], rows[-1][0], len(entry)
+
+
+def _window_cutoff(gate: str, today: str) -> str:
+    """The evidence window CLOSES at its gate date and never reopens.
+
+    WHY THIS EXISTS (bug found + fixed 2026-09-18, after all three windows
+    closed): the original judge selected rows with no upper date bound, so
+    every run re-judged on ALL ledger rows accumulated to that day. Past a
+    gate date that silently turns the registered verdict into a moving
+    average of post-gate data. It bit exactly as designed to prevent:
+    carry's all-in Sharpe read -1.69 at its 60-mark close (2026-09-11) =
+    DEAD, but -2.07 / -1.38 / +0.03 at 59 / 61 / 67 marks — so on 09-18 the
+    unbounded judge printed carry ALIVE and advanced the decision table to
+    "carry backbone", resurrecting a sleeve the registered window had
+    already failed, on 7 days of out-of-window data.
+
+    A pre-registered criterion is (metric, threshold, WINDOW). Dropping the
+    window is the same class of error as moving the threshold — it just
+    looks like nothing happened. So: the frozen reading is THE verdict;
+    post-gate rows are printed as clearly-labelled continuation with zero
+    decision weight (they inform what to research next, never whether the
+    gate passed).
+
+    中文：预注册判据 = (指标, 阈值, 窗口)。窗口丢了和阈值被挪是同一类错误，
+    只是看起来什么都没发生。原实现取账本全部行、无上界 → gate 日之后每天
+    重判一次，等于用窗外数据做事后平均。carry 实证：收窗当日（09-11, 60
+    marks）Sharpe −1.69 = DEAD；到 09-18（67 marks）变 +0.03 → 工具竟打出
+    ALIVE 并把决策表推到"carry 骨架"。故此处硬截断：冻结读数=唯一裁定，
+    窗外数据仅作明示标注的延续观测，不参与判决。
+    """
+    return min(gate, today)
 
 
 def _verdict(ok: bool) -> str:
@@ -149,19 +183,27 @@ def main():
 
     # ---------------- evidence line 1: v13 live ----------------
     left = _days_between(today, V13_GATE)
-    marks = conn.execute("SELECT COUNT(*) FROM basket_pnl").fetchone()[0]
+    cut = _window_cutoff(V13_GATE, today)   # window freeze / 窗口硬截断
+    marks = conn.execute("SELECT COUNT(*) FROM basket_pnl WHERE date <= ?",
+                         (cut,)).fetchone()[0]
+    n_post = conn.execute("SELECT COUNT(*) FROM basket_pnl WHERE date > ?",
+                          (cut,)).fetchone()[0]
     print(f"\n  [1] v13 live — due {V13_GATE} "
-          f"({max(left, 0)} days left, {marks}/{V13_TARGET_DAYS} daily marks)")
+          f"({max(left, 0)} days left, {marks}/{V13_TARGET_DAYS} daily marks "
+          f"in window, judged through {cut})")
     v13_alive = None
     if marks == 0:
         print("      no ledger rows yet")
     else:
-        n_logged, pairs = compute_live_ics(DB)
+        n_logged, all_pairs = compute_live_ics(DB)
+        # a pair needs its t+1 close, so it is in-window iff date_t1 <= cut
+        # IC 日对需要 t+1 收盘价 → 以 date_t1 是否在窗内为准
+        pairs = [p for p in all_pairs if p[1] <= cut]
         ics = [p[3] for p in pairs]
         v13_cum = conn.execute(
-            "SELECT cumulative_ret FROM basket_pnl "
-            "ORDER BY date DESC LIMIT 1").fetchone()[0]
-        ew_cum, ew_d0, ew_d1, ew_n = ew_buy_hold_benchmark(conn)
+            "SELECT cumulative_ret FROM basket_pnl WHERE date <= ? "
+            "ORDER BY date DESC LIMIT 1", (cut,)).fetchone()[0]
+        ew_cum, ew_d0, ew_d1, ew_n = ew_buy_hold_benchmark(conn, cut)
         if ics:
             mean_ic = sum(ics) / len(ics)
             _, ic_t = _sharpe_daily(ics)  # t-stat of mean over pair ICs
@@ -179,18 +221,30 @@ def main():
         if a_ok is not None:
             v13_alive = a_ok and b_ok
             tag = (f"if today were gate day — {left} days early" if left > 0
-                   else "WINDOW COMPLETE — this is the registered reading")
+                   else "WINDOW CLOSED — this is the registered verdict")
             print(f"      line reading (A AND B)     : "
                   f"{'ALIVE' if v13_alive else 'DEAD'}  [{tag}]")
+            if n_post:
+                pcum = conn.execute(
+                    "SELECT cumulative_ret FROM basket_pnl "
+                    "ORDER BY date DESC LIMIT 1").fetchone()[0]
+                pew, _, pd1, _ = ew_buy_hold_benchmark(conn, today)
+                print(f"      [out-of-window continuation: +{n_post} marks to "
+                      f"{pd1} → v13 {pcum:+.2%} vs EW {pew:+.2%}; NOT part of")
+                print(f"       the verdict — informs research, not the gate]")
 
     # ---------------- evidence line 2: carry live ----------------
     left_c = _days_between(today, CARRY_GATE)
+    cut_c = _window_cutoff(CARRY_GATE, today)
     crows = conn.execute(
         "SELECT port_ret, funding_pnl, cost_est FROM carry_pnl "
-        "ORDER BY date").fetchall()
+        "WHERE date <= ? ORDER BY date", (cut_c,)).fetchall()
+    crows_post = conn.execute(
+        "SELECT port_ret, funding_pnl, cost_est FROM carry_pnl "
+        "WHERE date > ? ORDER BY date", (cut_c,)).fetchall()
     print(f"\n  [2] carry live — due {CARRY_GATE} "
           f"({max(left_c, 0)} days left, {len(crows)}/{CARRY_TARGET_DAYS} "
-          f"daily marks)")
+          f"daily marks in window, judged through {cut_c})")
     carry_alive = None
     if not crows:
         print("      no ledger rows yet")
@@ -211,9 +265,16 @@ def main():
               f"over {len(crows)} days  -> {_verdict(b_ok)}")
         carry_alive = a_all and b_ok
         tag = (f"if today were gate day — {left_c} days early" if left_c > 0
-               else "WINDOW COMPLETE — this is the registered reading")
+               else "WINDOW CLOSED — this is the registered verdict")
         print(f"      line reading (A AND B)     : "
               f"{'ALIVE' if carry_alive else 'DEAD'}  [{tag}]")
+        if crows_post:
+            s_p, t_p = _sharpe_daily(
+                [pr + fp - ce for pr, fp, ce in crows + crows_post])
+            print(f"      [out-of-window continuation: +{len(crows_post)} marks"
+                  f" → all-in Sharpe would read {s_p:+.2f} (t={t_p:+.2f}) on")
+            print(f"       {len(crows) + len(crows_post)} marks. The window "
+                  f"closed at {cut_c}; this does NOT revive the sleeve.]")
 
     # ---------------- evidence line 3: extended-window backtest ----------------
     print("\n  [3] extended-window backtest — RESOLVED 2026-07-13:")
@@ -222,8 +283,13 @@ def main():
     print("      See RESEARCH_2026-07-13_extended_window.md + _objectives.md")
 
     # ---------------- decision table ----------------
-    print("\n  DECISION TABLE (pre-registered; reading is provisional until")
-    print("  both windows complete — do NOT act on partial-window noise):")
+    all_closed = (_days_between(today, V13_GATE) <= 0
+                  and _days_between(today, CARRY_GATE) <= 0)
+    print("\n  DECISION TABLE (pre-registered, ROADMAP Phase 3; judged on the")
+    if all_closed:
+        print("  FROZEN in-window readings above — post-gate rows excluded):")
+    else:
+        print("  in-window rows only — provisional until the windows close):")
     if v13_alive is None or carry_alive is None:
         print("      insufficient data to place a reading")
     elif v13_alive and carry_alive:
@@ -241,11 +307,17 @@ def main():
     # 2026-07-14, after the ROADMAP froze, so this line was added late but
     # still ~7 weeks before its window completes. 07-23 追加注册（用户签核）。
     left_o = _days_between(today, O2_GATE)
+    cut_o = _window_cutoff(O2_GATE, today)
     orows = conn.execute(
-        "SELECT port_ret, cost_est FROM o2_pnl ORDER BY date").fetchall()
+        "SELECT port_ret, cost_est FROM o2_pnl WHERE date <= ? "
+        "ORDER BY date", (cut_o,)).fetchall()
+    orows_post = conn.execute(
+        "SELECT port_ret, cost_est FROM o2_pnl WHERE date > ? "
+        "ORDER BY date", (cut_o,)).fetchall()
     print(f"\n  [4] O2 live — due {O2_GATE} "
           f"({max(left_o, 0)} days left, {len(orows)}/{O2_TARGET_DAYS} "
-          f"daily marks; gate registered 2026-07-23 at 9/60)")
+          f"daily marks in window, judged through {cut_o}; "
+          f"gate registered 2026-07-23 at 9/60)")
     if orows:
         gross = 1.0
         net = 1.0
@@ -265,13 +337,41 @@ def main():
         print(f"          ramp toward 1.0 — early Sharpe not comparable)")
         o2_alive = a_ok and b_ok
         tag = (f"if today were gate day — {left_o} days early" if left_o > 0
-               else "WINDOW COMPLETE — this is the registered reading")
+               else "WINDOW CLOSED — this is the registered verdict")
         print(f"      line reading (A AND B)     : "
               f"{'ALIVE' if o2_alive else 'DEAD'}  [{tag}]")
+        if orows_post:
+            s_p, t_p = _sharpe_daily(
+                [pr - ce for pr, ce in orows + orows_post])
+            wy_p = (sum(pr for pr, _ in orows + orows_post)
+                    / (len(orows) + len(orows_post)))
+            print(f"      [out-of-window continuation: +{len(orows_post)} marks"
+                  f" → net Sharpe {s_p:+.2f}, w·r {wy_p:+.4%}/d on "
+                  f"{len(orows) + len(orows_post)} marks; not the verdict]")
         print(f"      consequence if DEAD at gate: v14 = carry-only skeleton,")
         print(f"      model side returns to the research desk")
     else:
         print("      no ledger rows yet")
+
+    # ---------------- frozen verdict summary ----------------
+    # Printed last so the registered outcome is the final word on screen,
+    # ahead of any out-of-window continuation numbers above.
+    # 冻结裁定汇总放最后：屏幕上最后一句必须是注册结论，不是窗外读数。
+    if all_closed and None not in (v13_alive, carry_alive):
+        o2_state = ("ALIVE" if o2_alive else "DEAD") if orows else "n/a"
+        print("\n  " + "=" * 66)
+        print(f"  REGISTERED VERDICT (windows closed; criteria frozen "
+              f"2026-07-13/07-23)")
+        print(f"    v13 {'ALIVE' if v13_alive else 'DEAD':<5} @ {V13_GATE}   "
+              f"carry {'ALIVE' if carry_alive else 'DEAD':<5} @ {CARRY_GATE}  "
+              f" O2 {o2_state:<5} @ {O2_GATE}")
+        if not v13_alive and not carry_alive and not (orows and o2_alive):
+            print("    -> v14 has NO surviving skeleton. The pre-registered")
+            print("       branch is: back to the research desk.")
+            print("    -> Do NOT re-judge on post-gate data, move the")
+            print("       benchmark, or re-annualize. The falsification is the")
+            print("       asset here; a rescued gate is worth nothing.")
+        print("  " + "=" * 66)
 
     conn.close()
     print()

@@ -1,0 +1,2 @@
+paper_daily_FINAL_2026-09-20.db  18569523573bf24d272db3485fdb562b4319c606f8c13d4da97dae74c2f044aa
+(= paper_daily.db as frozen on 2026-09-20, after the September gates closed)

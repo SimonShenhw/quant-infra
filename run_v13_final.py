@@ -177,7 +177,19 @@ def build_from_parquet(
     raw_5m = load_klines_multi(interval="5m", min_rows=40000)
     print(f"  Loaded {len(raw_5m)} symbols")
 
+    # ⚠️ UNIVERSE IS LAKE-ORDER DEPENDENT AND DRIFTS. This picks the first
+    # `max_assets` symbols in alphabetical order of whatever the lake holds
+    # today, so GROWING THE LAKE SILENTLY CHANGES THE TRAINING UNIVERSE: as of
+    # 2026-09-20 it resolves to a set that includes FET/FIL/PEPE/RENDER and
+    # excludes SOL/SUI/UNI/XRP, i.e. NOT the 20 coins the live basket trades
+    # and not the set v13 trained on. Same failure class as the survivorship
+    # case study in FALSIFICATION_2026-09-19 addendum 6bis. Printed loudly
+    # below so it can never drift unnoticed again; pin explicitly (see
+    # tools/pipeline_calibration.load_pinned) when reproducing old results.
+    # ⚠️ 宇宙随 lake 内容漂移：扩充 lake 会静默改变训练宇宙。下面显式打印，
+    # 复现旧结果时必须自行钉死宇宙。
     syms = sorted(raw_5m.keys())[:max_assets]
+    print(f"  universe resolved (lake-order dependent!): {syms}")
     agg_dfs = {sym: aggregate_5m_to_1h(raw_5m[sym]) for sym in syms}
 
     # align on common timestamps — positional head() can misalign cross-sections

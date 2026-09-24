@@ -59,15 +59,58 @@ def _load_trials() -> dict:
     return {"historical_base": HISTORICAL_BASE, "trials": []}
 
 
-def register_trial(name: str, meta: Optional[dict] = None) -> None:
-    """Append a trial (idempotent by name). / 登记一次试验（按名幂等）。"""
+# Power admission (2026-09-24, continuation-plan debt 0.6 = FALSIFICATION
+# §8 rule 4). A NEW trial must declare the effect it hopes to detect and the
+# window it will be judged on; with t ≈ SR_ann × √years, a trial that cannot
+# reach t ≥ POWER_T_MIN in its own window is refused. WHY: the September
+# gates judged SR 0.14–0.8 strategies on 60/90-day windows (SE of SR_ann
+# ≈ 2.5) — they could never have confirmed anything (FALSIFICATION §5).
+# 功效准入：新试验必须申报期望效应与评估窗口，t≈SR×√年数 达不到门槛就拒绝登记。
+POWER_T_MIN: float = 2.0
+
+
+def register_trial(name: str, meta: Optional[dict] = None, *,
+                   effect_sr_ann: Optional[float] = None,
+                   window_years: Optional[float] = None,
+                   underpowered_reason: Optional[str] = None) -> None:
+    """Append a trial (idempotent by name). / 登记一次试验（按名幂等）。
+
+    Already-registered names return immediately, so the 2026-07 research
+    scripts (registered before power admission existed) re-run unchanged.
+    A NEW name must pass power admission: expected t = effect_sr_ann ×
+    √window_years ≥ POWER_T_MIN, or carry an explicit underpowered_reason
+    (e.g. "exploratory, never deployed"). Underpowered trials are still
+    COUNTED — they consume the multiple-testing budget like any other.
+    已登记的名字直接返回（旧脚本不受影响）；新名字须过功效准入，或写明
+    underpowered_reason。低功效试验照样计入 n_trials——它们同样消耗多重检验预算。"""
     data = _load_trials()
     if any(t["name"] == name for t in data["trials"]):
         return
+    if effect_sr_ann is None or window_years is None:
+        raise ValueError(
+            f"new trial {name!r}: declare effect_sr_ann (annualized Sharpe you "
+            f"expect to detect) and window_years (length of the evaluation "
+            f"window) — power admission, FALSIFICATION_2026-09-19 §8 rule 4")
+    if effect_sr_ann <= 0 or window_years <= 0:
+        raise ValueError(f"new trial {name!r}: effect_sr_ann and window_years "
+                         f"must be positive")
+    t_exp = effect_sr_ann * math.sqrt(window_years)
+    min_years = (POWER_T_MIN / effect_sr_ann) ** 2
+    reason = (underpowered_reason or "").strip()
+    if t_exp < POWER_T_MIN and not reason:
+        raise ValueError(
+            f"underpowered trial {name!r}: SR {effect_sr_ann:g} over "
+            f"{window_years:g}y gives expected t = {t_exp:.2f} < {POWER_T_MIN:g}; "
+            f"detecting it needs >= {min_years:.1f} years. Lengthen the window, "
+            f"or pass underpowered_reason= to register it as explicitly "
+            f"exploratory (it is still counted).")
     data["trials"].append({
         "name": name,
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "meta": meta or {},
+        "power": {"effect_sr_ann": effect_sr_ann, "window_years": window_years,
+                  "expected_t": t_exp, "min_years_for_t2": min_years,
+                  "underpowered_reason": reason or None},
     })
     with open(TRIALS_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)

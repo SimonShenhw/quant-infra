@@ -24,6 +24,10 @@ refactors and only breaks when semantics break:
   T5  ledger conservation: ContinuousBook (O2) vs analytic GP values
   T6  upsert idempotence / gap handling / cumulative-chain telescoping
       -> integrity of the pre-registered September evidence ledgers
+  T7  power admission (2026-09-24): a new trial whose declared effect
+      cannot reach t >= 2 in its declared window cannot enter the registry
+      -> the September class: 60/90-day gates judged on SR < 1 strategies
+         and could never have confirmed anything (FALSIFICATION §5)
 
 All DB tests run on throwaway temp files — the live paper_daily.db is never
 touched. No pytest dependency; plain asserts; exit code 1 on any failure.
@@ -348,13 +352,59 @@ def t6_orchestration_upsert_and_chain():
         conn.close()
 
 
+def t7_power_admission():
+    """T7: register_trial refuses underpowered NEW trials; legacy names
+    stay idempotent. Runs on a throwaway registry — trials.json untouched.
+    T7：新试验须过功效准入；已登记的名字保持幂等。临时登记表，不碰 trials.json。"""
+    from tools import validation_stats as vs
+    orig = vs.TRIALS_PATH
+    with tempfile.TemporaryDirectory() as d:
+        vs.TRIALS_PATH = Path(d) / "trials.json"
+        try:
+            vs.TRIALS_PATH.write_text(json.dumps(
+                {"historical_base": 56, "trials": [{"name": "legacy", "ts": "x",
+                                                    "meta": {}}]}),
+                encoding="utf-8")
+            # legacy name without power params: idempotent no-op, no error
+            vs.register_trial("legacy")
+            assert vs.dsr_n_trials() == 57
+            # new name, no declaration -> refused
+            try:
+                vs.register_trial("new_undeclared")
+                raise AssertionError("undeclared new trial was admitted")
+            except ValueError:
+                pass
+            # v13's own numbers (SR 0.806 over 1.50y, t = 0.99) -> refused
+            try:
+                vs.register_trial("v13_like", effect_sr_ann=0.806,
+                                  window_years=1.5)
+                raise AssertionError("underpowered trial was admitted")
+            except ValueError as e:
+                assert "underpowered" in str(e)
+            # ... unless explicitly marked exploratory; then COUNTED
+            vs.register_trial("v13_like", effect_sr_ann=0.806, window_years=1.5,
+                              underpowered_reason="exploratory, never deployed")
+            # adequately powered: SR 1.5 over 2y -> t = 2.12, admitted
+            vs.register_trial("powered", effect_sr_ann=1.5, window_years=2.0)
+            assert vs.dsr_n_trials() == 59
+            reg = json.loads(vs.TRIALS_PATH.read_text(encoding="utf-8"))
+            by = {t["name"]: t for t in reg["trials"]}
+            assert abs(by["v13_like"]["power"]["expected_t"]
+                       - 0.806 * 1.5 ** 0.5) < 1e-12
+            assert by["v13_like"]["power"]["underpowered_reason"]
+            assert by["powered"]["power"]["underpowered_reason"] is None
+        finally:
+            vs.TRIALS_PATH = orig
+
+
 def main():
     """Run every invariant even after a failure (one broken invariant must
-    not mask another), print the x/6 tally, exit nonzero on any failure.
+    not mask another), print the x/N tally, exit nonzero on any failure.
     全部跑完不早退（故障不互相遮蔽），任一失败以非零码退出。"""
     tests = [t1_timestamp_golden, t2_no_lookahead,
              t3_checkpoint_fingerprint, t4_ledger_conservation,
-             t5_continuous_book_conservation, t6_orchestration_upsert_and_chain]
+             t5_continuous_book_conservation, t6_orchestration_upsert_and_chain,
+             t7_power_admission]
     failed = 0
     for fn in tests:
         try:

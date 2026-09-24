@@ -36,3 +36,7 @@ venv/
 run_paper_daily_scheduled.bat
 run_paper_daily_hidden.vbs
 paper_daily_log.txt
+
+# Forward-looking plans / unpublished research ideas — never pushed
+# 前瞻计划与未发表的研究想法——不进公开仓库
+private/

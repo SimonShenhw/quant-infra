@@ -107,7 +107,7 @@ walk-forward + embargo（21 天）、成本感知回测（默认 10bps/边）、
 
 | 他们的发现 | 本项目的对应发现 | 判断 |
 |---|---|---|
-| **#8 crypto-perp funding carry：净 Sharpe 0.87，t_NW −3.54，仍未过预注册 DSR 门槛（0.865 < 0.95）**；并记录该交易"已从 Sharpe 2.3 衰减到 ~0.4 as the trade institutionalized"，且崩盘偏度 −1.87 | carry 回测 Sharpe 0.53；live 全口径 −1.69；funding 收入全程为正但价格腿吃掉它 | **独立确认**：carry 机制真实但过不了多重检验门槛，且正在被机构化磨平 |
+| **#8 crypto-perp funding carry：净 Sharpe 0.87，t_NW −3.54，仍未过预注册 DSR 门槛（0.865 < 0.95）**；并记录该交易"已从 Sharpe 2.3 衰减到 ~0.4 as the trade institutionalized"，且崩盘偏度 −1.87。⚠️ README 未写明是否对冲；其注册判据是 **rank IC 的 t 值**（`scripts/run_carry.py`），即横截面信号——与本项目**未对冲**的横截面 carry sleeve 同类，这正是两者可比的原因 | carry 回测 Sharpe 0.53；live 全口径 −1.69；funding 收入全程为正但价格腿吃掉它 | **独立确认**：同类（横截面）carry 信号过不了多重检验门槛，且在衰减 |
 | **#10 carry 尾部版："clean IC signal, negative P&L"**，作者自己标注为整个项目里 IC≠P&L 最干净的展品 | w·y24 = −0.033%/天：IC 每年为正但美元空间为负（`RESEARCH_2026-07-13_extended_window.md`） | **独立复现本项目的核心诊断** |
 | 生存偏差对照：同一个 ridge 模型，静态宇宙（今天的成分股）净 Sharpe **+0.82** / IC +0.033；时点真实宇宙 **−0.01** / IC +0.005（t_NW 0.54）。作者结论："The entire edge was hindsight in the universe selection." | CTRL 实验：同窗口同配方，仅去掉 4 个晚上市山寨 + funding 因子，**+32.6% → −13.6%** | **同一失效类的两个实例** |
 | #11 CEF 折价回归：原始 SR 1.11、DSR 0.999（看起来是大发现），被一个**入场延迟诊断**推翻（1.11 → 0.10），判定为微结构假象 | 本项目的同类角色 = ENGINE_CROSSCHECK 的成本模型敏感性（−13.1pp） | 提醒：**DSR 过关也不等于真**，执行侧诊断能独立推翻它 |
@@ -141,7 +141,7 @@ combo 虚拟账本，没有独立基准臂）和**因子中性化增量检验**�
 | 方向 | 文献怎么说 | 裁决 |
 |---|---|---|
 | **继续日频横截面因子** | 发表最优 Sharpe ~1.5，衰减后 ~0.63，需 10 年验证 | ❌ **结构上不可验证**，停 |
-| **机制型：delta-hedged funding capture** | BIS WP 1087 确认 carry 真实存在；但 CEX/DEX 套利研究显示 17% 观测有 ≥20bps 价差，而**最好的机会里只有 40% 在扣成本与价差反转后仍为正**；qr-alpha-lab 记录 Sharpe 2.3→0.4 的机构化衰减 | ⚠️ **算术上可验证（若 Sharpe 真高则窗口短），但赛道正在被磨平**；要做必须新预注册 |
+| **机制型：delta-hedged funding capture** | BIS WP 1087 确认 carry 真实存在；但 CEX/DEX 套利研究显示 17% 观测有 ≥20bps 价差，而**最好的机会里只有 40% 在扣成本与价差反转后仍为正**；qr-alpha-lab 另有一份**不计分的** delta-neutral 现货–永续 cash-and-carry 可行性研究（`results/carry_basis_feasibility.json`，Binance 2019-09→2026-06，大盘组往返 5bps），always-on 年均收益 2024 **13.3%** → 2025 **3.6%** → 2026（至 6 月）**−0.3%**（勘误见文末） | ⚠️ **2026 年已趋近零**；算术上可验证，但赛道已被磨平；要做必须新预注册 |
 | **高频 / LOB 执行侧** | 报告 Sharpe 1.38–0.86；费率敏感性极端（0.2%→0.6% 费率下成交次数 24.54→7.85）；多数论文成交假设乐观 | ⚠️ 方向对（高 Sharpe 才能快速验证）但**是换数据基建量级的决定**，不是换模型 |
 | **合成信号验证管线** | qr-alpha-lab 的标准做法，且是本项目 §6"未确立"栏的唯一可填项 | ✅ **已执行**，见 `tools/pipeline_calibration.py` 与 §6 |
 
@@ -221,6 +221,17 @@ OOS −26% / 发表后 −58% 同一量级（⚠️ 类比：MP 是美股异象�
 校准工具已显式钉死宇宙；该隐患本身记录在此，供任何未来复跑者注意。
 
 ---
+
+## 勘误（2026-09-24）
+
+1. **§5 原先把 qr-alpha-lab trial #8 的"Sharpe 2.3→0.4"当作 delta-hedged carry 的证据——不成立。**
+   #8 的 README 未写明对冲方式，而其注册判据是 rank IC 的 t 值（横截面信号）。该 repo 里
+   真正 delta-neutral 的是另一份**不计分**的可行性研究；§5 已换成那份研究的数据，
+   数字已在原始 JSON 中核实。§3 对 #8 与本项目 carry sleeve 的对照保留，并补了同类说明。
+2. **以下数字来自检索摘要，未回原文复核**，引用前请先核：§2 的 McLean–Pontiff 26% / 58%；
+   §5 的 CEX/DEX "17% / 40%"；§2 表中的加密动量 14.59% / 31.96% / Sharpe 1.51。
+3. §3 中 qr-alpha-lab 的其余条目（#10、#11、#12、生存偏差对照、合成验证）来自
+   2026-09-20 对该 repo README 的抓取；#8 相关内容已于 2026-09-24 回到脚本与 JSON 复核。
 
 ## 参考
 

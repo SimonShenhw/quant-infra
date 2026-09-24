@@ -57,7 +57,8 @@ grown since v13 trained (27 symbols now), so that expression SILENTLY
 returns a different 20 coins today than it did then -- it now picks up
 FET/FIL/PEPE/RENDER and drops SOL/SUI/UNI/XRP relative to the live basket.
 This tool therefore pins the universe to the live basket's own first-day
-symbol list and patches the loader accordingly. See the same hazard,
+symbol list (since 2026-09-24 build_from_parquet itself requires an explicit
+symbols= argument, so no loader patch is needed any more). See the same hazard,
 independently found, in qr-alpha-lab's survivorship case study (static
 universe Sharpe +0.82 vs point-in-time -0.01).
 ⚠️ build_from_parquet 的宇宙随 lake 增长而静默漂移，故此处显式钉死为
@@ -81,7 +82,6 @@ sys.path.insert(0, str(BASE))
 sys.path.insert(0, str(BASE / "tools"))
 
 import run_v13_final as V13                      # noqa: E402
-from data.lake_loader import load_klines_multi as _real_loader  # noqa: E402
 from paper_live_ic import spearman               # noqa: E402
 
 DB = BASE / "paper_daily.db"
@@ -107,25 +107,14 @@ def live_universe() -> list[str]:
 
 
 def load_pinned(symbols: list[str]):
-    """build_from_parquet with the universe pinned (see module docstring).
-    Patching the loader keeps every one of build_from_parquet's alignment
-    and label conventions intact — re-deriving them here would be exactly
-    the duplicate-implementation drift this repo keeps getting burned by.
-    钉死宇宙后复用 build_from_parquet，绝不另写一份对齐/标签逻辑。"""
-    def _pinned(interval="5m", min_rows=10_000, **kw):
-        raw = _real_loader(symbols=symbols, interval=interval,
-                           min_rows=min_rows, **kw)
-        missing = [s for s in symbols if s not in raw]
-        if missing:
-            raise RuntimeError(f"pinned symbols missing from lake: {missing}")
-        return raw
-    orig = V13.load_klines_multi
-    V13.load_klines_multi = _pinned
-    try:
-        return V13.build_from_parquet(SEQ_LEN, len(symbols),
-                                      torch.device("cpu"))
-    finally:
-        V13.load_klines_multi = orig
+    """build_from_parquet on an explicitly pinned universe.
+    Since 2026-09-24 build_from_parquet REQUIRES symbols= (debt 0.1), so the
+    loader monkeypatch this function used to install is gone; every
+    alignment and label convention is still build_from_parquet's own.
+    自 2026-09-24 起 build_from_parquet 必须显式传 symbols=，原先的 loader
+    打补丁写法已删除；对齐与标签口径仍完全由 build_from_parquet 决定。"""
+    return V13.build_from_parquet(SEQ_LEN, len(symbols), torch.device("cpu"),
+                                  symbols=symbols)
 
 
 def zscore_rows(a: np.ndarray) -> np.ndarray:

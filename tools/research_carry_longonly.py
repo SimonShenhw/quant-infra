@@ -75,7 +75,7 @@ from engine.cpcv import generate_cpcv_splits
 from engine.twap_executor import TWAPExecutor
 from model.cross_asset_attention import CrossAssetGRUAttention
 from run_v13_final import (  # reuse the exact v13 pipeline / 复用v13管线
-    build_from_parquet, _banded_targets, LABEL_H, SEED,
+    build_from_parquet, _banded_targets, LABEL_H, SEED, V13_SYMBOLS,
 )
 from tools.validation_stats import probabilistic_sharpe
 
@@ -259,7 +259,7 @@ def main():
     print("  OFFLINE RESEARCH: long-only + funding carry vs v13 LS")
     print("=" * 70)
 
-    X, y24, r1h_t, close_t, syms, n_factors = build_from_parquet(SEQ_LEN, 20, device)
+    X, y24, r1h_t, close_t, syms, n_factors = build_from_parquet(SEQ_LEN, 20, device, symbols=V13_SYMBOLS)
     # bar timestamps per symbol for funding alignment (rebuild like pipeline)
     from data.lake_loader import load_klines_multi
     import polars as pl

@@ -103,7 +103,7 @@ def build_cache(force: bool) -> Dict[str, np.ndarray]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Rebuild] device={device}")
     X, y24, r1h, close_mat, syms, n_factors = v13.build_from_parquet(
-        SEQ_LEN, MAX_ASSETS, device)
+        SEQ_LEN, MAX_ASSETS, device, symbols=v13.V13_SYMBOLS)
     n_samples, n_assets = X.size(0), X.size(1)
 
     purge = SEQ_LEN + v13.LABEL_H  # must match run_cpcv / 与 run_cpcv 一致

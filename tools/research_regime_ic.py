@@ -53,7 +53,7 @@ import torch
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-from run_v13_final import build_from_parquet
+from run_v13_final import build_from_parquet, V13_SYMBOLS
 from tools.research_carry_longonly import rebuild_oos_predictions
 
 SEQ_LEN = 24
@@ -77,7 +77,7 @@ def main():
     print("  REGIME-CONDITIONED IC (v13 OOS predictions)")
     print("=" * 70)
 
-    X, y24_t, r1h_t, close_t, syms, _ = build_from_parquet(SEQ_LEN, 20, device)
+    X, y24_t, r1h_t, close_t, syms, _ = build_from_parquet(SEQ_LEN, 20, device, symbols=V13_SYMBOLS)
     pred_t, valid_t = rebuild_oos_predictions(X, device)
     pred = pred_t.cpu().numpy()
     y24 = y24_t.cpu().numpy()

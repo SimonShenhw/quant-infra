@@ -85,7 +85,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -107,6 +107,20 @@ from tools.validation_stats import probabilistic_sharpe, deflated_sharpe
 import factors  # noqa: F401  trigger auto-discover / 触发因子自动发现
 
 SEED: int = 42
+
+# The v13 training universe, PINNED. It equals run_paper_daily.SYMBOLS (the
+# deployed v13 model's universe) and basket_state's first-day all_closes —
+# verified identical 2026-09-24. Kept in sorted order because that is the
+# asset order v13 was trained with (the old default was sorted(lake)[:20],
+# which matched this set only while the lake held exactly these 20 coins).
+# v13 训练宇宙（钉死）：与模拟盘 SYMBOLS、basket_state 首日宇宙逐一核对一致；
+# 保持字母序——v13 训练时的资产顺序就是字母序。
+V13_SYMBOLS: List[str] = [
+    "AAVEUSDT", "ADAUSDT", "APTUSDT", "ARBUSDT", "ATOMUSDT", "AVAXUSDT",
+    "BNBUSDT", "BTCUSDT", "DOGEUSDT", "DOTUSDT", "ETHUSDT", "INJUSDT",
+    "LINKUSDT", "LTCUSDT", "NEARUSDT", "OPUSDT", "SOLUSDT", "SUIUSDT",
+    "UNIUSDT", "XRPUSDT",
+]
 
 # Refreshed via tools/factor_analyzer.py on TRUE 1h bars (2026-06-10 rerun):
 # macd |IC_1h|=0.0013 |IC_24h|=0.0055, volume_zscore 0.0070/0.0033 — noise at
@@ -170,26 +184,44 @@ def load_and_align_funding(
 
 def build_from_parquet(
     seq_len: int, max_assets: int, device: torch.device,
+    symbols: Optional[List[str]] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, List[str], int]:
     """4D factor tensor + 24h label + 1h bar returns (for PnL accounting).
-    Returns (X, y24, r1h, close_mat, syms, n_factors)."""
+    Returns (X, y24, r1h, close_mat, syms, n_factors).
+
+    `symbols` is REQUIRED (2026-09-24, continuation-plan debt 0.1). The old
+    default sorted(lake)[:max_assets] silently changed the training universe
+    whenever the lake grew; there is deliberately no default any more, so a
+    forgotten argument fails loudly instead of training on the wrong coins.
+    Pass V13_SYMBOLS to reproduce v13. Symbols are used in sorted order
+    (v13's trained asset order); max_assets must equal len(symbols).
+    ⚠️ This pins the UNIVERSE only. The window END still follows the lake;
+    scripts that need exact reproduction keep their n_samples guards.
+    symbols 为必填：旧默认值会随 lake 扩充静默换宇宙，故取消默认、忘传即报错。
+    只钉死宇宙，窗口终点仍随 lake 延伸（需精确复现的脚本各自有 n_samples 守卫）。"""
+    if symbols is None:
+        raise ValueError(
+            "build_from_parquet: pass symbols= explicitly (use V13_SYMBOLS to "
+            "reproduce v13). The old default sorted(lake)[:max_assets] silently "
+            "changes the universe whenever the lake grows.")
+    if len(symbols) != max_assets:
+        raise ValueError(f"max_assets={max_assets} but {len(symbols)} symbols given")
     print("[Data] Loading from Parquet data lake (timestamps normalized) ...")
-    raw_5m = load_klines_multi(interval="5m", min_rows=40000)
+    raw_5m = load_klines_multi(symbols=list(symbols), interval="5m", min_rows=40000)
+    missing = sorted(set(symbols) - set(raw_5m))
+    if missing:
+        raise RuntimeError(f"pinned symbols missing from lake or below "
+                           f"min_rows: {missing}")
     print(f"  Loaded {len(raw_5m)} symbols")
 
-    # ⚠️ UNIVERSE IS LAKE-ORDER DEPENDENT AND DRIFTS. This picks the first
-    # `max_assets` symbols in alphabetical order of whatever the lake holds
-    # today, so GROWING THE LAKE SILENTLY CHANGES THE TRAINING UNIVERSE: as of
-    # 2026-09-20 it resolves to a set that includes FET/FIL/PEPE/RENDER and
-    # excludes SOL/SUI/UNI/XRP, i.e. NOT the 20 coins the live basket trades
-    # and not the set v13 trained on. Same failure class as the survivorship
-    # case study in FALSIFICATION_2026-09-19 addendum 6bis. Printed loudly
-    # below so it can never drift unnoticed again; pin explicitly (see
-    # tools/pipeline_calibration.load_pinned) when reproducing old results.
-    # ⚠️ 宇宙随 lake 内容漂移：扩充 lake 会静默改变训练宇宙。下面显式打印，
-    # 复现旧结果时必须自行钉死宇宙。
-    syms = sorted(raw_5m.keys())[:max_assets]
-    print(f"  universe resolved (lake-order dependent!): {syms}")
+    # Pinned universe, sorted = v13's trained asset order. History: until
+    # 2026-09-24 this line was sorted(raw_5m.keys())[:max_assets], which
+    # silently resolved to a DIFFERENT 20 coins once the lake grew (it picked
+    # up FET/FIL/PEPE/RENDER and dropped SOL/SUI/UNI/XRP) — the survivorship
+    # failure class of FALSIFICATION_2026-09-19 addendum 6bis.
+    # 钉死的宇宙（字母序=v13 训练顺序）。旧写法随 lake 扩充静默换币，见报告 §6bis。
+    syms = sorted(symbols)
+    print(f"  universe (pinned): {syms}")
     agg_dfs = {sym: aggregate_5m_to_1h(raw_5m[sym]) for sym in syms}
 
     # align on common timestamps — positional head() can misalign cross-sections
@@ -628,7 +660,7 @@ def main():
     SEQ_LEN = 24
     MAX_ASSETS = 20
     X, y24, r1h, close_mat, syms, n_factors = build_from_parquet(
-        SEQ_LEN, MAX_ASSETS, device)
+        SEQ_LEN, MAX_ASSETS, device, symbols=V13_SYMBOLS)
     factor_names = [n for n in FactorRegistry.list_factors() if n not in DROP_FACTORS]
 
     pred_matrix, valid_mask, fold_corrs = run_cpcv(X, y24, SEQ_LEN, n_factors, device)
